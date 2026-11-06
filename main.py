@@ -33,6 +33,7 @@ import panels
 import drawing_tools
 import linkdraw_investigation
 from collaboration_client import CollaborationClient, canonical_state
+from collaboration_client import mongo_safe_state
 
 MOD = "Command" if sys.platform == "darwin" else "Control"
 MM_W, MM_H = 190, 130
@@ -3253,7 +3254,10 @@ class LinkDrawApp:
                 ):
                     self.collaboration_pending = True
                     self.collaboration_last_submitted = fingerprint
-                    client.submit(copy.deepcopy(state), self.collaboration_revision)
+                    client.submit(
+                        mongo_safe_state(state),
+                        self.collaboration_revision,
+                    )
             self._schedule_collaboration_tick()
 
     def _apply_collaboration_state(self, state):

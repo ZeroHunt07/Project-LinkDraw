@@ -14,7 +14,27 @@ PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
 def canonical_state(state):
-    return json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(
+        mongo_safe_state(state),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def mongo_safe_state(value):
+    """Convert mappings to BSON-compatible documents without mutating the model."""
+    if isinstance(value, dict):
+        normalized = {}
+        for key, child in value.items():
+            string_key = str(key)
+            if string_key in normalized:
+                raise ValueError(f"Snapshot contains duplicate keys after BSON conversion: {string_key}")
+            normalized[string_key] = mongo_safe_state(child)
+        return normalized
+    if isinstance(value, list):
+        return [mongo_safe_state(item) for item in value]
+    return value
 
 
 class CollaborationClient:
@@ -30,7 +50,7 @@ class CollaborationClient:
         self.database_name = database_name
         self.project_id = project_id
         self.create_new = create_new
-        self.initial_state = initial_state
+        self.initial_state = mongo_safe_state(initial_state)
         self.events = queue.Queue()
         self._outbound = queue.Queue()
         self._stop = threading.Event()
@@ -83,6 +103,7 @@ class CollaborationClient:
         return {"revision": 0, "state": self.initial_state}
 
     def _save_project(self, state, expected_revision):
+        state = mongo_safe_state(state)
         result = self._projects.update_one(
             {"_id": self.project_id, "revision": expected_revision},
             {

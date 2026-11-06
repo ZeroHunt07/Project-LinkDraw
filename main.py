@@ -5,15 +5,20 @@ Complete Implementation of 70 Features across Visualization, Interaction,
 Layouts, Analysis, Import/Export, Graph Properties, Metadata, UX, and Performance.
 """
 import copy
+import base64
+import io
 import json
 import math
 import os
 import sys
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
+from PIL import Image
 
 from graph_model import (
-    GraphModel, SHAPES, LINE_TYPES, ARROWS, WIDTHS, FSIZES,
+    GraphModel, SHAPES, LINE_TYPES, LINE_STYLES, LINE_DASH_PATTERNS, ARROWS, WIDTHS, FSIZES,
+    FONT_FAMILIES, FONT_STYLES,
     NODE_COLORS_LIGHT, NODE_COLORS_DARK, NODE_COLORS_HC,
     LINE_COLORS_LIGHT, LINE_COLORS_DARK, LINE_COLORS_HC
 )
@@ -22,8 +27,8 @@ import layouts
 import io_manager
 import dialogs
 import panels
-import investigation
 import drawing_tools
+import linkdraw_investigation
 
 MOD = "Command" if sys.platform == "darwin" else "Control"
 MM_W, MM_H = 190, 130
@@ -42,6 +47,7 @@ class LinkDrawApp:
         self.dirty = False
         self.clip = None
         self.paste_offset = 0
+        self.style_clipboard = None
 
         # ---- View & Coordinates
         self.scale = 1.0
@@ -52,6 +58,11 @@ class LinkDrawApp:
         self.mode = None
         self.hover_node = None
         self.hover_conn = None
+        self.image_cache = {}
+        self._node_font_cache = {}
+        self._node_label_layout_cache = {}
+        self._note_window_savers = {}
+        self.drag_redraw_after = None
         self.cur = (0, 0)
         self.space_pressed = False
         self.mm_t = None
@@ -71,6 +82,7 @@ class LinkDrawApp:
 
         # Layout animator
         self.animator = layouts.LayoutAnimator(self)
+        self._note_windows = {}
 
         # Freehand brush & sidebar state
         self.brush_color = "#ef4444"
@@ -84,11 +96,15 @@ class LinkDrawApp:
         # ---- UI Variables
         self.tool = tk.StringVar(value="select")
         self.shape_var = tk.StringVar(value="rounded")
-        self.line_var = tk.StringVar(value="curved")
-        self.arrow_var = tk.StringVar(value="forward")
+        self.line_var = tk.StringVar(value=self.model.settings["default_line_type"])
+        self.arrow_var = tk.StringVar(value=self.model.settings["default_arrow"])
         self.dash_var = tk.BooleanVar(value=False)
-        self.width_var = tk.StringVar(value="2")
+        self.width_var = tk.StringVar(value=str(self.model.settings["default_line_width"]))
+        self.line_style_var = tk.StringVar(value=self.model.settings["default_line_style"])
+        self.line_color_var = tk.StringVar(value=self.model.settings["default_line_color"])
         self.fs_var = tk.StringVar(value="11")
+        self.node_font_var = tk.StringVar(value=self.model.settings["default_font_family"])
+        self.node_font_style_var = tk.StringVar(value=self.model.settings["default_font_style"])
         self.status = tk.StringVar()
         self.zoom_text = tk.StringVar(value="100%")
         self.search_var = tk.StringVar()
@@ -97,9 +113,10 @@ class LinkDrawApp:
         self.theme = tk.StringVar(value="light")
         self.grid_var = tk.BooleanVar(value=True)
         self.snap_var = tk.BooleanVar(value=True)
-        self.drag_pan = tk.StringVar(value="box")
+        self.drag_pan = tk.StringVar(value=self.model.settings.get("drag_pan", "pan"))
         self.minimap_var = tk.BooleanVar(value=True)
         self.animated_flow_var = tk.BooleanVar(value=False)
+        self.flow_speed_var = tk.StringVar(value=str(self.model.settings.get("flow_speed", 2)))
         self.legend_var = tk.BooleanVar(value=False)
 
         # Build UI
@@ -115,14 +132,32 @@ class LinkDrawApp:
         if io_manager.check_recovery_available() and not os.environ.get("LINKDRAW_TEST"):
             if messagebox.askyesno("Recover Session", "An auto-saved session was found. Would you like to recover it?"):
                 io_manager.load_autosave(self.model)
-                self.theme.set(self.model.settings.get("theme", "light"))
-                self.grid_var.set(self.model.settings.get("grid", True))
-                self.snap_var.set(self.model.settings.get("snap", True))
+                self.sync_document_settings()
+                has_visible_content = any((
+                    self.model.nodes,
+                    self.model.sticky_notes,
+                    self.model.freehand_strokes,
+                ))
+                if not has_visible_content:
+                    populated_page = next(
+                        (
+                            name for name, page in self.sidebar.page_manager.pages.items()
+                            if any(page.get(collection) for collection in ("nodes", "sticky_notes", "freehand_strokes"))
+                        ),
+                        None,
+                    )
+                    if populated_page:
+                        self.sidebar.page_manager.switch_page(populated_page)
+                        self.sidebar.page_var.set(populated_page)
+                    else:
+                        self.load_demo()
             else:
                 self.load_demo()
         else:
             self.load_demo()
+        self.sidebar.page_manager.persist()
 
+        self.apply_widget_theme()
         self.on_tool_change()
         root.after(180, self.fit)
 
@@ -191,11 +226,16 @@ class LinkDrawApp:
         e.add_command(label="Copy", accelerator=f"{acc}+C", command=self.copy_selection)
         e.add_command(label="Paste", accelerator=f"{acc}+V", command=self.paste_selection)
         e.add_command(label="Duplicate Subgraph", accelerator=f"{acc}+D", command=self.duplicate_selection)
+        e.add_command(label="Copy Style", command=self.copy_selected_style)
+        e.add_command(label="Paste Style", command=self.paste_selected_style)
         e.add_command(label="Delete", accelerator="Del", command=self.delete_selected)
         e.add_separator()
         e.add_command(label="Select All", accelerator=f"{acc}+A", command=self.select_all)
+        e.add_command(label="Select Connected Neighbors", command=self.select_connected_neighbors)
+        e.add_command(label="Select Entire Component", command=self.select_component)
         e.add_command(label="Find / Search...", accelerator=f"{acc}+F", command=self.focus_search)
         e.add_command(label="Inline Edit Text", accelerator="Enter", command=self.edit_selected_inline)
+        e.add_command(label="Open Element Notes", accelerator="Shift+N", command=self.open_selected_element_notes)
         e.add_command(label="Swap Connection Direction", command=self.reverse_selected_conn)
         e.add_separator()
         e.add_command(label="Add Sticky Note", command=self.add_sticky_note)
@@ -210,6 +250,8 @@ class LinkDrawApp:
         lay.add_command(label="Force-Directed (Fruchterman–Reingold)", command=lambda: self.apply_layout("force"))
         lay.add_command(label="Circular Layout", command=lambda: self.apply_layout("circle"))
         lay.add_command(label="Grid Layout", command=lambda: self.apply_layout("grid"))
+        lay.add_command(label="Concentric by Connection Distance", command=lambda: self.apply_layout("concentric"))
+        lay.add_command(label="Topology Spiral", command=lambda: self.apply_layout("spiral"))
         lay.add_command(label="Hierarchical / Layered (Sugiyama DAG)", command=lambda: self.apply_layout("hierarchical"))
         lay.add_command(label="Radial Tree Layout", command=lambda: self.apply_layout("radial_tree"))
         lay.add_command(label="Kamada–Kawai Spring Embedding", command=lambda: self.apply_layout("kamada_kawai"))
@@ -272,6 +314,16 @@ class LinkDrawApp:
         v.add_command(label="Zoom Out", command=lambda: self.zoom_center(0.8))
         v.add_command(label="Reset Zoom (100%)", command=self.reset_zoom)
         v.add_command(label="Fit to Screen", accelerator="F", command=self.fit)
+        v.add_radiobutton(
+            label="Drag Empty Canvas to Pan",
+            variable=self.drag_pan, value="pan",
+            command=lambda: self.set_drag_pan_mode("pan"),
+        )
+        v.add_radiobutton(
+            label="Drag Empty Canvas to Select",
+            variable=self.drag_pan, value="box",
+            command=lambda: self.set_drag_pan_mode("box"),
+        )
         v.add_separator()
 
         # Theme Switcher (1)
@@ -281,11 +333,18 @@ class LinkDrawApp:
         thm.add_radiobutton(label="High-Contrast Theme", variable=self.theme, value="high_contrast", command=self.on_theme_change)
         v.add_cascade(label="Theme Palette", menu=thm)
 
-        v.add_checkbutton(label="Show Minimap", variable=self.minimap_var, command=self.redraw)
-        v.add_checkbutton(label="Show Grid", variable=self.grid_var, command=self.redraw)
-        v.add_checkbutton(label="Snap to Grid / Guides", variable=self.snap_var)
+        v.add_checkbutton(label="Show Minimap", variable=self.minimap_var, command=self.on_view_setting_change)
+        v.add_checkbutton(label="Show Grid", variable=self.grid_var, command=self.on_view_setting_change)
+        v.add_checkbutton(label="Snap to Grid / Guides", variable=self.snap_var, command=self.on_view_setting_change)
         v.add_checkbutton(label="Animated Edge Flow", variable=self.animated_flow_var, command=self.toggle_edge_flow)
-        v.add_checkbutton(label="Show Legend", variable=self.legend_var, command=self.redraw)
+        flow_speed_menu = tk.Menu(v, tearoff=0)
+        for label, speed in (("Slow", 1), ("Normal", 2), ("Fast", 4)):
+            flow_speed_menu.add_radiobutton(
+                label=label, variable=self.flow_speed_var, value=str(speed),
+                command=lambda selected=speed: self.set_flow_speed(selected),
+            )
+        v.add_cascade(label="Edge Flow Speed", menu=flow_speed_menu)
+        v.add_checkbutton(label="Show Legend", variable=self.legend_var, command=self.on_view_setting_change)
         v.add_separator()
 
         # Data & Analysis Views (44–46, 51–55, 56)
@@ -293,13 +352,21 @@ class LinkDrawApp:
         v.add_command(label="Node List Table...", command=self.show_node_list)
         v.add_command(label="Edge List Table...", command=self.show_edge_list)
         v.add_command(label="Adjacency Matrix...", command=self.show_adjacency_matrix)
+        v.add_command(label="Tree View...", command=lambda: dialogs.TreeView(self))
+        v.add_command(label="Timeline View...", command=lambda: dialogs.TimelineView(self))
+        v.add_command(label="Formula Sheet...", command=lambda: dialogs.FormulaSheetDialog(self))
         v.add_command(label="Tags & Categories Manager...", command=self.show_tags_manager)
         v.add_separator()
         v.add_command(label="Preferences...", command=self.show_preferences)
+        v.add_command(
+            label="Privacy-Safe Breach Resources...",
+            command=lambda: dialogs.open_privacy_safe_breach_resources(self.root),
+        )
         m.add_cascade(label="View", menu=v)
 
         # ---- Help (19)
         h = tk.Menu(m, tearoff=0)
+        h.add_command(label="Quick Start & Usage Tips...", command=self.show_usage_guide)
         h.add_command(label="Keyboard Shortcuts (?)...", accelerator="?", command=self.show_shortcuts)
         h.add_command(label="About LinkDraw Pro", command=self.show_about)
         m.add_cascade(label="Help", menu=h)
@@ -323,105 +390,105 @@ class LinkDrawApp:
         bar = ttk.Frame(r, padding=(6, 4))
         bar.pack(side="top", fill="x")
 
-        # Mode tools
-        for text, val in (("Select (V)", "select"), ("Node (N)", "node"),
-                          ("Connect (C)", "connect"), ("Draw (B)", "draw"),
-                          ("Erase (R)", "erase"), ("Hand (H)", "hand")):
-            ttk.Radiobutton(bar, text=text, value=val, variable=self.tool,
+        tools = ttk.LabelFrame(bar, text="Tools", padding=(4, 2))
+        tools.pack(side="left", padx=2, fill="y")
+        for text, val in (("Select V", "select"), ("Node N", "node"),
+                          ("Connect C", "connect"), ("Draw B", "draw"),
+                          ("Erase R", "erase"), ("Hand H", "hand")):
+            ttk.Radiobutton(tools, text=text, value=val, variable=self.tool,
                             style="Toolbutton", command=self.on_tool_change).pack(side="left", padx=1)
-        self._sep(bar)
 
-        # Edit quick actions
+        edit = ttk.LabelFrame(bar, text="Edit", padding=(4, 2))
+        edit.pack(side="left", padx=2, fill="y")
         for text, cmd in (("Undo", self.undo), ("Redo", self.redo),
                           ("Delete", self.delete_selected), ("Edit", self.edit_selected_inline)):
-            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=1)
-        self._sep(bar)
+            ttk.Button(edit, text=text, command=cmd).pack(side="left", padx=1)
 
-        # Zoom
-        ttk.Button(bar, text="-", width=2, command=lambda: self.zoom_center(0.8)).pack(side="left")
-        ttk.Button(bar, textvariable=self.zoom_text, width=6, command=self.reset_zoom).pack(side="left", padx=1)
-        ttk.Button(bar, text="+", width=2, command=lambda: self.zoom_center(1.25)).pack(side="left")
-        ttk.Button(bar, text="Fit", width=4, command=self.fit).pack(side="left", padx=2)
-        self._sep(bar)
+        view = ttk.LabelFrame(bar, text="View", padding=(4, 2))
+        view.pack(side="left", padx=2, fill="y")
+        ttk.Button(view, text="−", width=2, command=lambda: self.zoom_center(0.8)).pack(side="left")
+        ttk.Button(view, textvariable=self.zoom_text, width=6, command=self.reset_zoom).pack(side="left", padx=1)
+        ttk.Button(view, text="+", width=2, command=lambda: self.zoom_center(1.25)).pack(side="left")
+        ttk.Button(view, text="Fit", width=4, command=self.fit).pack(side="left", padx=2)
 
-        # Animated Flow toggle
-        ttk.Checkbutton(bar, text="Flow", variable=self.animated_flow_var,
-                        command=self.toggle_edge_flow).pack(side="left", padx=2)
-
-        # Theme quick switcher
-        ttk.Label(bar, text="Theme:").pack(side="left", padx=(4, 2))
-        cb_th = ttk.Combobox(bar, textvariable=self.theme, values=["light", "dark", "high_contrast"],
-                             width=11, state="readonly")
-        cb_th.pack(side="left", padx=2)
-        cb_th.bind("<<ComboboxSelected>>", lambda e: self.on_theme_change())
-        self._sep(bar)
-
-        # 60. Search bar
-        ttk.Label(bar, text="Find:").pack(side="left", padx=(4, 2))
-        self.search_entry = ttk.Entry(bar, textvariable=self.search_var, width=14)
-        self.search_entry.pack(side="left", padx=2)
-        self.search_entry.bind("<Return>", lambda e: self.do_search())
-        self.search_entry.bind("<KeyRelease>", lambda e: self.on_search_key())
-        ttk.Button(bar, text="🔍", width=3, command=self.do_search).pack(side="left", padx=1)
-
-        # Properties, Shortcuts & Sidebar Toggle
-        ttk.Button(bar, text="☰ Panel", command=self.toggle_sidebar).pack(side="right", padx=2)
-        ttk.Button(bar, text="Stats", command=self.show_properties).pack(side="right", padx=2)
-        ttk.Button(bar, text="?", width=2, command=self.show_shortcuts).pack(side="right", padx=2)
-
-        # Secondary toolbar: Node & Edge Styling
-        bar2 = ttk.Frame(r, padding=(6, 0, 6, 4))
+        bar2 = ttk.Frame(r, padding=(4, 0, 4, 4))
         bar2.pack(side="top", fill="x")
 
-        # Shape
-        ttk.Label(bar2, text="Shape:").pack(side="left")
-        self._combo(bar2, self.shape_var, SHAPES, self.on_shape_change, 9)
+        node_style = ttk.LabelFrame(bar2, text="Node style", padding=(4, 2))
+        node_style.pack(side="left", padx=2, fill="y")
+        ttk.Label(node_style, text="Shape").pack(side="left")
+        self._combo(node_style, self.shape_var, SHAPES, self.on_shape_change, 7)
 
-        # Fill color
-        ttk.Label(bar2, text="Fill:").pack(side="left", padx=(6, 2))
-        self.swatch_frame = ttk.Frame(bar2)
+        ttk.Label(node_style, text="Fill").pack(side="left", padx=(6, 2))
+        self.swatch_frame = ttk.Frame(node_style)
         self.swatch_frame.pack(side="left")
         self.update_color_swatches()
 
-        # Font size
-        ttk.Label(bar2, text="Font:").pack(side="left", padx=(8, 2))
-        self._combo(bar2, self.fs_var, FSIZES, self.on_fs_change, 3)
+        ttk.Label(node_style, text="Font").pack(side="left", padx=(8, 2))
+        self._combo(node_style, self.fs_var, FSIZES, self.on_fs_change, 3)
+        self._combo(node_style, self.node_font_var, FONT_FAMILIES, self.on_node_font_change, 9)
+        self._combo(
+            node_style, self.node_font_style_var, FONT_STYLES,
+            self.on_node_font_style_change, 9,
+        )
 
-        # Icon
-        ttk.Button(bar2, text="Icon...", command=self.pick_node_icon).pack(side="left", padx=4)
-        self._sep(bar2)
+        ttk.Button(node_style, text="Icon…", command=self.pick_node_icon).pack(side="left", padx=4)
 
-        # Line options
-        ttk.Label(bar2, text="Line:").pack(side="left")
-        self._combo(bar2, self.line_var, LINE_TYPES, self.on_conn_style_change, 9)
-        ttk.Label(bar2, text="Arrow:").pack(side="left", padx=(6, 2))
-        self._combo(bar2, self.arrow_var, ARROWS, self.on_conn_style_change, 8)
-        ttk.Label(bar2, text="Width:").pack(side="left", padx=(6, 2))
-        self._combo(bar2, self.width_var, WIDTHS, self.on_conn_style_change, 3)
-        ttk.Checkbutton(bar2, text="Dash", variable=self.dash_var,
-                        command=self.on_conn_style_change).pack(side="left", padx=4)
+        edge_style = ttk.LabelFrame(bar2, text="Connection style", padding=(4, 2))
+        edge_style.pack(side="left", padx=2, fill="y")
+        ttk.Label(edge_style, text="Line").pack(side="left")
+        self._combo(edge_style, self.line_var, LINE_TYPES, self.on_conn_style_change, 7)
+        ttk.Label(edge_style, text="Arrow").pack(side="left", padx=(6, 2))
+        self._combo(edge_style, self.arrow_var, ARROWS, self.on_conn_style_change, 6)
+        ttk.Label(edge_style, text="Width").pack(side="left", padx=(6, 2))
+        self._combo(edge_style, self.width_var, WIDTHS, self.on_conn_style_change, 3)
+        ttk.Label(edge_style, text="Pattern").pack(side="left", padx=(6, 2))
+        self._combo(edge_style, self.line_style_var, LINE_STYLES, self.on_conn_style_change, 7)
 
-        # Line color
-        ttk.Button(bar2, text="Line Col...", command=self.pick_conn_color).pack(side="left", padx=4)
-        self._sep(bar2)
+        ttk.Button(edge_style, text="Color…", command=self.pick_conn_color).pack(side="left", padx=4)
 
-        # ── Brush / Draw controls ─────────────────────────────────────────────
-        ttk.Label(bar2, text="Brush:").pack(side="left")
-        ttk.Button(bar2, text="Col...", command=self.pick_brush_color).pack(side="left", padx=2)
-        ttk.Label(bar2, text="Sz:").pack(side="left", padx=(4, 0))
-        ttk.Button(bar2, text="−", width=2,
+        bar3 = ttk.Frame(r, padding=(6, 0, 6, 4))
+        bar3.pack(side="top", fill="x")
+
+        drawing = ttk.LabelFrame(bar3, text="Freehand", padding=(4, 2))
+        drawing.pack(side="left", padx=2, fill="y")
+        ttk.Button(drawing, text="Color…", command=self.pick_brush_color).pack(side="left", padx=2)
+        ttk.Label(drawing, text="Size").pack(side="left", padx=(4, 0))
+        ttk.Button(drawing, text="−", width=2,
                    command=lambda: self._adj_brush(-1)).pack(side="left")
-        self.brush_sz_label = ttk.Label(bar2, text=str(self.brush_width), width=3, anchor="center")
+        self.brush_sz_label = ttk.Label(drawing, text=str(self.brush_width), width=3, anchor="center")
         self.brush_sz_label.pack(side="left")
-        ttk.Button(bar2, text="+", width=2,
+        ttk.Button(drawing, text="+", width=2,
                    command=lambda: self._adj_brush(1)).pack(side="left")
-        # Quick size presets
-        for lbl, sz in (("S", 2), ("M", 5), ("L", 10), ("XL", 20)):
-            ttk.Button(bar2, text=lbl, width=2,
-                       command=lambda s=sz: self._set_brush_sz(s)).pack(side="left", padx=1)
+        brush_presets = {"S": 2, "M": 5, "L": 10, "XL": 20}
+        self.brush_preset_var = tk.StringVar(value="M")
+        brush_preset = ttk.Combobox(
+            drawing, textvariable=self.brush_preset_var, values=list(brush_presets),
+            width=4, state="readonly",
+        )
+        brush_preset.pack(side="left", padx=2)
+        brush_preset.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._set_brush_sz(brush_presets[self.brush_preset_var.get()]),
+        )
         self.highlight_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar2, text="Hilite", variable=self.highlight_var).pack(side="left", padx=(4, 2))
-        ttk.Button(bar2, text="Clear Strokes", command=self.clear_strokes).pack(side="left", padx=4)
+        ttk.Checkbutton(drawing, text="Highlight", variable=self.highlight_var).pack(side="left", padx=(4, 2))
+        ttk.Button(drawing, text="Clear", command=self.clear_strokes).pack(side="left", padx=4)
+
+        search = ttk.LabelFrame(bar3, text="Find in canvas", padding=(4, 2))
+        search.pack(side="left", padx=2, fill="y", expand=True)
+        self.search_entry = ttk.Entry(search, textvariable=self.search_var, width=14)
+        self.search_entry.pack(side="left", padx=2)
+        self.search_entry.bind("<Return>", lambda e: self.do_search())
+        self.search_entry.bind("<KeyRelease>", lambda e: self.on_search_key())
+        ttk.Button(search, text="Search", command=self.do_search).pack(side="left", padx=1)
+
+        workspace = ttk.LabelFrame(bar3, text="Workspace", padding=(4, 2))
+        workspace.pack(side="right", padx=2, fill="y")
+        ttk.Button(workspace, text="Guide", command=self.show_usage_guide).pack(side="left", padx=1)
+        ttk.Button(workspace, text="OSINT", command=self.open_osint_workspace).pack(side="left", padx=1)
+        ttk.Button(workspace, text="Panel", command=self.toggle_sidebar).pack(side="left", padx=1)
+        ttk.Button(workspace, text="Image…", command=self.add_image_node).pack(side="left", padx=1)
 
         # Re-focus canvas after tool clicks
         for cls in ("TButton", "TRadiobutton", "TCheckbutton"):
@@ -439,13 +506,19 @@ class LinkDrawApp:
     def update_color_swatches(self):
         for widget in self.swatch_frame.winfo_children():
             widget.destroy()
-        th = self.theme.get()
-        colors = NODE_COLORS_HC if th == "high_contrast" else (NODE_COLORS_DARK if th == "dark" else NODE_COLORS_LIGHT)
-        for col in colors[:6]:
-            lbl = tk.Label(self.swatch_frame, bg=col, width=2, relief="solid", bd=1, cursor="hand2")
-            lbl.pack(side="left", padx=1)
-            lbl.bind("<Button-1>", lambda e, c=col: self.set_selected_node_color(c))
-        ttk.Button(self.swatch_frame, text="🎨", width=2, command=self.pick_custom_node_color).pack(side="left", padx=1)
+        palette = tk.Menubutton(self.swatch_frame, text="Palette ▾", relief="raised")
+        palette.pack(side="left", padx=1)
+        menu = tk.Menu(palette, tearoff=0)
+        colors = self.model.settings.get("brand_colors", [])
+        for color in colors[:12]:
+            menu.add_command(
+                label=f"●  {color}",
+                foreground=color,
+                command=lambda selected_color=color: self.set_selected_node_color(selected_color),
+            )
+        menu.add_separator()
+        menu.add_command(label="Custom color…", command=self.pick_custom_node_color)
+        palette.configure(menu=menu)
 
     # =========================================================================
     # Canvas, Minimap & Unified Sidebar
@@ -454,11 +527,14 @@ class LinkDrawApp:
         self.main_container = ttk.Frame(self.root)
         self.main_container.pack(fill="both", expand=True)
 
-        self.canvas = tk.Canvas(self.main_container, bg="#fafafa", highlightthickness=0)
-        self.canvas.pack(side="left", fill="both", expand=True)
-
-        self.sidebar = panels.UnifiedSidebar(self.main_container, self)
-        self.sidebar.pack(side="right", fill="y")
+        self.workspace_panes = ttk.Panedwindow(self.main_container, orient="horizontal")
+        self.workspace_panes.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(self.workspace_panes, bg="#fafafa", highlightthickness=0)
+        self.sidebar = panels.UnifiedSidebar(self.workspace_panes, self)
+        self.workspace_panes.add(self.canvas, weight=1)
+        self.workspace_panes.add(self.sidebar, weight=0)
+        self.root.after_idle(self._set_initial_sidebar_width)
+        self.workspace_panes.bind("<ButtonRelease-1>", self._on_workspace_resize)
         self.sidebar_visible = True
         c = self.canvas
 
@@ -490,12 +566,25 @@ class LinkDrawApp:
 
     def toggle_sidebar(self):
         if self.sidebar_visible:
-            self.sidebar.pack_forget()
+            self.workspace_panes.forget(self.sidebar)
             self.sidebar_visible = False
         else:
-            self.sidebar.pack(side="right", fill="y")
+            self.workspace_panes.add(self.sidebar, weight=0)
             self.sidebar_visible = True
-        self.redraw()
+            self.root.after_idle(self._set_initial_sidebar_width)
+        self.root.after_idle(self.fit)
+
+    def _on_workspace_resize(self, _event=None):
+        self.root.after_idle(self.fit)
+
+    def _set_initial_sidebar_width(self):
+        if self.sidebar_visible and str(self.sidebar) in self.workspace_panes.panes():
+            width = self.workspace_panes.winfo_width()
+            if width > 400:
+                self.workspace_panes.sashpos(0, max(400, width - 360))
+
+    def open_osint_workspace(self):
+        return self.sidebar.open_osint_window()
 
     def pick_brush_color(self):
         col = colorchooser.askcolor(self.brush_color, parent=self.root, title="Brush Color")[1]
@@ -540,12 +629,14 @@ class LinkDrawApp:
 
     def bind_keys(self):
         r = self.root
-        r.bind("<Delete>", lambda e: self.delete_selected())
-        r.bind("<BackSpace>", lambda e: self.delete_selected())
+        r.bind("<Delete>", self.delete_selected_from_key)
+        r.bind("<BackSpace>", self.delete_selected_from_key)
         r.bind("<Return>", lambda e: self.edit_selected_inline())
+        r.bind("<F2>", lambda e: self.edit_selected_inline())
         r.bind("<Escape>", self.on_escape)
         r.bind("<KeyPress-space>", self.space_down)
         r.bind("<KeyRelease-space>", self.space_up)
+        r.bind_all("<Shift-n>", self.open_selected_element_notes)
 
         # 64. Mode keys: V=select, N=add node, E/C=add edge, D=delete
         r.bind("v", lambda e: self.set_tool("select"))
@@ -573,9 +664,37 @@ class LinkDrawApp:
             r.bind(f"<{key}>", lambda e, a=dx, b=dy: self.nudge_selected(a * 10, b * 10))
             r.bind(f"<Shift-{key}>", lambda e, a=dx, b=dy: self.nudge_selected(a, b))
 
+    def delete_selected_from_key(self, event):
+        if self._text_input_has_focus():
+            return None
+        self.delete_selected()
+        return "break"
+
+    def _text_input_has_focus(self):
+        try:
+            focused = self.root.focus_get()
+            while focused is not None:
+                if focused.winfo_class() in {
+                    "Entry", "Text", "TEntry", "TCombobox", "Spinbox", "TSpinbox",
+                }:
+                    return True
+                focused = focused.master
+        except tk.TclError:
+            return True
+        return False
+
     # =========================================================================
     # Theme & Coordinate Mapping
     # =========================================================================
+    def _layer_config(self, name):
+        return self.model.settings.get("layers", {}).get(name, {})
+
+    def _layer_visible(self, name):
+        return self._layer_config(name).get("visible", True)
+
+    def _layer_locked(self, name):
+        return self._layer_config(name).get("locked", False)
+
     def theme_colors(self):
         th = self.theme.get()
         if th == "dark":
@@ -610,7 +729,7 @@ class LinkDrawApp:
     # =========================================================================
     # Redraw & Rendering
     # =========================================================================
-    def redraw(self):
+    def redraw(self, update_minimap=True):
         c = self.canvas
         T = self.T = self.theme_colors()
         c.config(bg=T["bg"])
@@ -630,6 +749,16 @@ class LinkDrawApp:
         v_min_y, v_max_y = min(vh0, vh1) - 60, max(vh0, vh1) + 60
         culling_enabled = self.model.settings.get("viewport_culling", True)
 
+        for nid, node in self.model.nodes.items():
+            if not self._layer_visible(node.get("layer", "Data")):
+                continue
+            if culling_enabled and (
+                node["x"] + node["w"] < v_min_x or node["x"] - node["w"] > v_max_x
+                or node["y"] + node["h"] < v_min_y or node["y"] - node["h"] > v_max_y
+            ):
+                continue
+            self._fit_node_label(nid, node)
+
         # Draw Grid
         if self.grid_var.get():
             step = self.model.settings.get("grid_size", 20) * s
@@ -646,6 +775,8 @@ class LinkDrawApp:
 
         # Draw Sticky Notes (58)
         for sid, sn in self.model.sticky_notes.items():
+            if not self._layer_visible(sn.get("layer", "Annotations")):
+                continue
             if culling_enabled and (sn["x"] + sn["w"] < v_min_x or sn["x"] - sn["w"] > v_max_x or
                                     sn["y"] + sn["h"] < v_min_y or sn["y"] - sn["h"] > v_max_y):
                 continue
@@ -654,7 +785,12 @@ class LinkDrawApp:
         # 5. Group parallel edges for bundling / curvature separation
         edge_pairs = {}
         for cid, cn in self.model.conns.items():
-            if cn["a"] in self.model.nodes and cn["b"] in self.model.nodes:
+            if (
+                cn["a"] in self.model.nodes and cn["b"] in self.model.nodes
+                and self._layer_visible(cn.get("layer", "Data"))
+                and self._layer_visible(self.model.nodes[cn["a"]].get("layer", "Data"))
+                and self._layer_visible(self.model.nodes[cn["b"]].get("layer", "Data"))
+            ):
                 pair = tuple(sorted([cn["a"], cn["b"]]))
                 edge_pairs.setdefault(pair, []).append(cid)
 
@@ -667,6 +803,8 @@ class LinkDrawApp:
 
         # Draw Nodes (6, 7)
         for nid, n in self.model.nodes.items():
+            if not self._layer_visible(n.get("layer", "Data")):
+                continue
             if culling_enabled and (n["x"] + n["w"] < v_min_x or n["x"] - n["w"] > v_max_x or
                                     n["y"] + n["h"] < v_min_y or n["y"] - n["h"] > v_max_y):
                 continue
@@ -723,13 +861,94 @@ class LinkDrawApp:
                           outline="#94a3b8", width=1, dash=(3, 3), tags="temp")
 
         # 63. Minimap
-        self.draw_minimap()
+        if update_minimap:
+            self.draw_minimap()
 
         # 65. Update breadcrumbs
         self.update_breadcrumbs()
 
     # ---- Draw Node (6, 7)
+    def _fit_node_label(self, nid, node):
+        label = node.get("text", "")
+        if node.get("icon"):
+            label = f"{node['icon']}  {label}"
+        if not node.get("auto_size_label", True):
+            return label
+
+        font_key = (
+            node.get("font_family", "Helvetica"),
+            int(node.get("fs", 11)),
+            node.get("font_style", "normal"),
+        )
+        layout_key = (label, font_key)
+        layout = self._node_label_layout_cache.get(layout_key)
+        if layout is None:
+            layout = self._compute_node_label_layout(label, font_key)
+            if len(self._node_label_layout_cache) >= 2048:
+                self._node_label_layout_cache.pop(next(iter(self._node_label_layout_cache)))
+            self._node_label_layout_cache[layout_key] = layout
+
+        wrapped_label, content_width, content_height = layout
+        node_width = min(360, max(float(node.get("w", 130)), content_width))
+        node_height = max(float(node.get("h", 60)), content_height)
+        if node_width != node.get("w") or node_height != node.get("h"):
+            node["w"] = node_width
+            node["h"] = node_height
+            self.model.update_spatial_node(nid)
+        return wrapped_label
+
+    def _compute_node_label_layout(self, label, font_key):
+        font = self._node_font_cache.get(font_key)
+        if font is None:
+            font = tkfont.Font(
+                root=self.root,
+                family=font_key[0],
+                size=font_key[1],
+                weight="bold" if "bold" in font_key[2] else "normal",
+                slant="italic" if "italic" in font_key[2] else "roman",
+            )
+            self._node_font_cache[font_key] = font
+
+        max_width = 360
+        line_limit = max_width - 20
+        lines = []
+        for paragraph in label.splitlines() or [""]:
+            words = paragraph.split()
+            if not words:
+                lines.append("")
+                continue
+            current = ""
+            for word in words:
+                pieces = [word]
+                if font.measure(word) > line_limit:
+                    pieces = []
+                    part = ""
+                    for char in word:
+                        if part and font.measure(part + char) > line_limit:
+                            pieces.append(part)
+                            part = ""
+                        part += char
+                    if part:
+                        pieces.append(part)
+                for piece in pieces:
+                    candidate = f"{current} {piece}".strip()
+                    if current and font.measure(candidate) > line_limit:
+                        lines.append(current)
+                        current = piece
+                    else:
+                        current = candidate
+            lines.append(current)
+
+        text_width = max((font.measure(line) for line in lines), default=0)
+        content_width = min(max_width, text_width + 20)
+        content_height = max(
+            60.0,
+            len(lines) * font.metrics("linespace") + 16,
+        )
+        return "\n".join(lines), content_width, content_height
+
     def draw_node(self, nid, n):
+        label_text = self._fit_node_label(nid, n)
         c, s, T = self.canvas, self.scale, self.T
         sx, sy = self.to_screen(n["x"], n["y"])
         hw, hh = n["w"] / 2.0 * s, n["h"] / 2.0 * s
@@ -739,8 +958,11 @@ class LinkDrawApp:
         shape = n.get("shape", "rounded")
 
         fill_col = n.get("color", NODE_COLORS_LIGHT[1])
-        outline_col = T["accent"] if sel else (n.get("highlight") or "#4b5563")
-        width = 3.5 if sel else (3.0 if n.get("highlight") else 1.5)
+        hovered = nid == self.hover_node
+        outline_col = T["accent"] if sel else (
+            T["accent"] if hovered else (n.get("highlight") or "#4b5563")
+        )
+        width = 3.5 if sel else (3.0 if hovered or n.get("highlight") else 1.5)
 
         kw = dict(fill=fill_col, outline=outline_col, width=width, tags=tag)
 
@@ -778,15 +1000,41 @@ class LinkDrawApp:
         else:  # rectangle
             c.create_rectangle(x1, y1, x2, y2, **kw)
 
-        # 7. Custom icon / emoji glyph + text
-        label_text = n.get("text", "")
-        if n.get("icon"):
-            label_text = f"{n['icon']}  {label_text}"
+        image_path = n.get("image_path")
+        if image_path and os.path.isfile(image_path):
+            image_size = (max(12, int(n["w"] * s - 14)), max(12, int(n["h"] * s - 30)))
+            cache_key = (image_path, image_size)
+            image = self.image_cache.get(cache_key)
+            if image is None:
+                try:
+                    with Image.open(image_path) as source:
+                        source.thumbnail(image_size)
+                        pixel_data = io.BytesIO()
+                        source.convert("RGB").save(pixel_data, format="GIF")
+                        image = tk.PhotoImage(
+                            master=self.canvas,
+                            data=base64.b64encode(pixel_data.getvalue()).decode("ascii"),
+                            format="GIF",
+                        )
+                    self.image_cache[cache_key] = image
+                except OSError:
+                    image = None
+            if image is not None:
+                c.create_image(sx, sy - 8 * s, image=image, tags=tag)
 
+        # 7. Custom icon / emoji glyph + text
         fs = max(6, int(n.get("fs", 11) * s))
-        txt_col = T["fg"] if (shape == "text" or self.theme.get() == "high_contrast") else "#111827"
-        c.create_text(sx, sy, text=label_text, justify="center", fill=txt_col,
-                      tags=tag, font=("Helvetica", fs, "bold" if sel else "normal"))
+        txt_col = n.get("text_color") or (
+            T["fg"] if (shape == "text" or self.theme.get() == "high_contrast") else "#111827"
+        )
+        label_y = sy + (hh * 0.62 if image_path else 0)
+        c.create_text(sx, label_y, text=label_text, justify="center", fill=txt_col,
+                      width=max(1, (n["w"] - 16) * s),
+                      tags=tag, font=(
+                          n.get("font_family", "Helvetica"),
+                          fs,
+                          n.get("font_style", "normal"),
+                      ))
 
         # 35. Badge (e.g. topological rank or order badge)
         if n.get("badge"):
@@ -814,9 +1062,11 @@ class LinkDrawApp:
         width = cn.get("width", 2)
         col = cn.get("highlight") or (T["line0"] if cn.get("color") == LINE_COLORS_LIGHT[0] else cn.get("color"))
 
-        # Selection glow
-        if sel:
-            c.create_line(*flat, fill=T["sel_glow"], width=width * s + 8, capstyle="round",
+        # Selection and hover glow
+        hovered = cid == self.hover_conn
+        if sel or hovered:
+            glow_size = 8 if sel else 4
+            c.create_line(*flat, fill=T["sel_glow"], width=width * s + glow_size, capstyle="round",
                           joinstyle="round", tags=tag)
 
         # Arrowhead specification
@@ -834,8 +1084,10 @@ class LinkDrawApp:
                         max(8, int((11 + width * 1.5) * s)),
                         max(3, int((3 + width) * s))),
         )
-        if cn.get("dash"):
-            opts["dash"] = (7, 4)
+        line_style = cn.get("line_style", "dashed" if cn.get("dash") else "solid")
+        dash_pattern = LINE_DASH_PATTERNS.get(line_style)
+        if dash_pattern:
+            opts["dash"] = dash_pattern
 
         # 8. Animated edge flow (marching dashes)
         if self.animated_flow_var.get() and cn.get("arrow") in ("forward", "both"):
@@ -857,7 +1109,7 @@ class LinkDrawApp:
             if lbl:
                 lx, ly = self.to_screen(*lab)
                 txt = c.create_text(lx, ly, text=lbl, fill=T["fg"], tags=tag,
-                                    font=("Helvetica", max(7, int(10 * s)), "bold" if sel else "normal"))
+                                    font=("Helvetica", max(7, int(10 * s)), "bold" if sel or hovered else "normal"))
                 bb = c.bbox(txt)
                 if bb:
                     bg_rect = c.create_rectangle(bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1,
@@ -870,6 +1122,12 @@ class LinkDrawApp:
                 hx, hy = self.to_screen(*pt)
                 c.create_oval(hx - 6, hy - 6, hx + 6, hy + 6, fill="white", outline=T["accent"],
                               width=2, tags=f"end:{cid}:{which}")
+        if sel and kind == "curve" and len(raw) >= 3:
+            hx, hy = self.to_screen(*raw[1])
+            c.create_oval(
+                hx - 6, hy - 6, hx + 6, hy + 6,
+                fill="#f97316", outline="white", width=1.5, tags=f"bend:{cid}",
+            )
 
     # ---- Draw Sticky Note (58)
     def draw_sticky_note(self, sid, sn):
@@ -878,6 +1136,17 @@ class LinkDrawApp:
         hw, hh = sn["w"] / 2.0 * s, sn["h"] / 2.0 * s
         tag = f"sticky:{sid}"
         sel = sid == self.sel_sticky
+
+        connected_node = self.model.nodes.get(sn.get("connected_node_id"))
+        connector = sn.get("style", {}).get("connector", "none")
+        if connected_node is not None and connector != "none":
+            nx, ny = self.to_screen(connected_node["x"], connected_node["y"])
+            options = {"fill": "#64748b", "width": max(1, s * 1.5), "tags": tag}
+            if connector == "arrow":
+                options["arrow"] = "last"
+            if connector == "curved":
+                options["smooth"] = True
+            c.create_line(nx, ny, sx, sy, **options)
 
         c.create_rectangle(sx - hw, sy - hh, sx + hw, sy + hh, fill=sn["color"],
                            outline="#ca8a04" if not sel else "#2563eb", width=2.5 if sel else 1.0, tags=tag)
@@ -964,7 +1233,7 @@ class LinkDrawApp:
         items = self.canvas.find_overlapping(sx - 4, sy - 4, sx + 4, sy + 4)
         for it in reversed(items):
             for t in self.canvas.gettags(it):
-                if t.startswith(("handle:", "node:", "conn:", "end:", "sticky:")):
+                if t.startswith(("handle:", "node:", "conn:", "end:", "bend:", "sticky:")):
                     parts = t.split(":")
                     return parts[0], int(parts[1]), int(parts[2]) if len(parts) > 2 else None
         return None
@@ -978,14 +1247,19 @@ class LinkDrawApp:
             cn = self.model.conns[conn]
             self.line_var.set(cn.get("type", "curved"))
             self.arrow_var.set(cn.get("arrow", "forward"))
-            self.dash_var.set(cn.get("dash", False))
+            line_style = cn.get("line_style", "dashed" if cn.get("dash") else "solid")
+            self.line_style_var.set(line_style)
+            self.dash_var.set(line_style != "solid")
             self.width_var.set(str(cn.get("width", 2)))
+            self.line_color_var.set(cn.get("color", self.model.settings["default_line_color"]))
         elif self.sel_nodes:
             nid = next(iter(self.sel_nodes))
             n = self.model.nodes.get(nid)
             if n:
                 self.shape_var.set(n.get("shape", "rounded"))
                 self.fs_var.set(str(n.get("fs", 11)))
+                self.node_font_var.set(n.get("font_family", "Helvetica"))
+                self.node_font_style_var.set(n.get("font_style", "normal"))
 
         self.redraw()
         if hasattr(self, "sidebar"):
@@ -1051,12 +1325,25 @@ class LinkDrawApp:
 
         # Handle resize
         if h and h[0] == "handle":
+            if self._layer_locked(self.model.nodes[h[1]].get("layer", "Data")):
+                self.status.set("That layer is locked; unlock it in Inspector to resize this element.")
+                return
             self.model.push_undo()
             self.mode, self.rs_id = "resize", h[1]
             return
 
+        if h and h[0] == "bend":
+            self.select(conn=h[1])
+            self.model.push_undo()
+            self.mode = "bend_connection"
+            self.bend_conn_id = h[1]
+            return
+
         # Reconnect end
         if h and h[0] == "end":
+            if self._layer_locked(self.model.conns[h[1]].get("layer", "Data")):
+                self.status.set("That layer is locked; unlock it in Inspector to reconnect this line.")
+                return
             self.mode, self.rc = "reconnect", (h[1], h[2])
             return
 
@@ -1070,6 +1357,9 @@ class LinkDrawApp:
         # Sticky Note click
         if h and h[0] == "sticky":
             self.select(sticky=h[1])
+            if self._layer_locked(self.model.sticky_notes[h[1]].get("layer", "Annotations")):
+                self.status.set("That layer is locked; unlock it in Inspector to move this note.")
+                return
             self.mode = "drag_sticky"
             self.drag_start = (wx, wy)
             self.drag_orig = (self.model.sticky_notes[h[1]]["x"], self.model.sticky_notes[h[1]]["y"])
@@ -1078,12 +1368,24 @@ class LinkDrawApp:
         # Node click / Multi-select (11, 12)
         if h and h[0] == "node":
             nid = h[1]
+            if e.state & 0x1:
+                if self._layer_locked(self.model.nodes[nid].get("layer", "Data")):
+                    self.status.set("That layer is locked; unlock it in Inspector before connecting from this element.")
+                    return
+                self.mode = "connect_pending"
+                self.conn_src = nid
+                self.connect_start = (e.x, e.y)
+                return
+
             # Shift / Ctrl multi-select toggle
-            if (e.state & 0x1) or (e.state & 0x4):
+            if e.state & 0x4:
                 self.select(nodes=self.sel_nodes ^ {nid})
             elif nid not in self.sel_nodes:
                 self.select(nodes={nid})
 
+            if self._layer_locked(self.model.nodes[nid].get("layer", "Data")):
+                self.status.set("That layer is locked; unlock it in Inspector to move this element.")
+                return
             self.mode = "drag"
             self.drag_start = (wx, wy)
             self.drag_orig = {i: (self.model.nodes[i]["x"], self.model.nodes[i]["y"]) for i in self.sel_nodes}
@@ -1111,7 +1413,11 @@ class LinkDrawApp:
         self.cur = (e.x, e.y)
         wx, wy = self.to_world(e.x, e.y)
 
-        if m == "pan":
+        if m == "connect_pending":
+            if math.hypot(e.x - self.connect_start[0], e.y - self.connect_start[1]) >= 4:
+                self.mode = "connect"
+                self.redraw()
+        elif m == "pan":
             self.pan_move(e)
         elif m == "drag":
             dx, dy = wx - self.drag_start[0], wy - self.drag_start[1]
@@ -1145,23 +1451,38 @@ class LinkDrawApp:
                         nx, ny = self.snap_val(nx), self.snap_val(ny)
 
                 self.model.nodes[i]["x"], self.model.nodes[i]["y"] = nx, ny
-                self.model.update_spatial_node(i)
 
-            self.redraw()
+            self.schedule_drag_redraw()
 
         elif m == "drag_sticky":
             dx, dy = wx - self.drag_start[0], wy - self.drag_start[1]
             sn = self.model.sticky_notes[self.sel_sticky]
             sn["x"], sn["y"] = self.drag_orig[0] + dx, self.drag_orig[1] + dy
-            self.model.update_spatial_sticky(self.sel_sticky)
-            self.redraw()
+            self.schedule_drag_redraw()
 
         elif m == "resize":
             n = self.model.nodes[self.rs_id]
+            n["auto_size_label"] = False
             n["w"] = max(50.0, round((wx - n["x"]) * 2))
             n["h"] = max(34.0, round((wy - n["y"]) * 2))
             self.model.update_spatial_node(self.rs_id)
             self.redraw()
+
+        elif m == "bend_connection":
+            conn = self.model.conns.get(self.bend_conn_id)
+            if conn:
+                source = self.model.nodes.get(conn["a"])
+                target = self.model.nodes.get(conn["b"])
+                if source and target:
+                    dx = target["x"] - source["x"]
+                    dy = target["y"] - source["y"]
+                    length = math.hypot(dx, dy) or 1.0
+                    mid_x = (source["x"] + target["x"]) / 2
+                    mid_y = (source["y"] + target["y"]) / 2
+                    conn["bend"] = (wx - mid_x) * (-dy / length) + (wy - mid_y) * (dx / length)
+                    conn["type"] = "curved"
+                    self.dirty = True
+                    self.redraw()
 
         elif m == "connect" or m == "reconnect":
             self.redraw()
@@ -1204,6 +1525,7 @@ class LinkDrawApp:
     def on_release(self, e):
         m, self.mode = self.mode, None
         self.active_guides.clear()
+        self.cancel_drag_redraw()
 
         # Connect release
         if m == "connect":
@@ -1218,7 +1540,8 @@ class LinkDrawApp:
                     type_=self.line_var.get(),
                     arrow=self.arrow_var.get(),
                     width=int(self.width_var.get()),
-                    dash=self.dash_var.get(),
+                    line_style=self.line_style_var.get(),
+                    color=self.line_color_var.get(),
                 )
                 self.select(conn=cid)
             elif self.hit(e.x, e.y) is None:
@@ -1226,8 +1549,22 @@ class LinkDrawApp:
                 wx, wy = self.to_world(e.x, e.y)
                 self.model.push_undo()
                 nid = self.model.make_node(wx, wy, text="Node")
-                cid = self.model.make_conn(self.conn_src, nid)
+                if hasattr(self, "sidebar"):
+                    self.model.nodes[nid]["layer"] = self.sidebar.active_layer_var.get()
+                cid = self.model.make_conn(
+                    self.conn_src,
+                    nid,
+                    type_=self.line_var.get(),
+                    arrow=self.arrow_var.get(),
+                    width=int(self.width_var.get()),
+                    line_style=self.line_style_var.get(),
+                    color=self.line_color_var.get(),
+                )
                 self.select(nodes={nid})
+            self.redraw()
+
+        elif m == "connect_pending":
+            self.select(nodes=self.sel_nodes ^ {self.conn_src})
             self.redraw()
 
         # Reconnect release
@@ -1256,7 +1593,21 @@ class LinkDrawApp:
             else:
                 self.redraw()
 
-        elif m in ("drag", "drag_sticky", "resize"):
+        elif m == "drag":
+            if self.drag_moved:
+                for nid in self.sel_nodes:
+                    self.model.update_spatial_node(nid)
+                self.model.dirty = True
+                self.dirty = True
+            self.redraw()
+
+        elif m == "drag_sticky":
+            self.model.update_spatial_sticky(self.sel_sticky)
+            self.model.dirty = True
+            self.dirty = True
+            self.redraw()
+
+        elif m in ("resize", "bend_connection"):
             self.redraw()
 
         elif m == "draw":
@@ -1275,7 +1626,6 @@ class LinkDrawApp:
     def on_double_click(self, e):
         h = self.hit(e.x, e.y)
         if h and h[0] == "node":
-            # 17. Inline label editing directly on the node!
             self.edit_node_inline(h[1])
         elif h and h[0] == "conn":
             # 18. Edge weight & label editing
@@ -1290,19 +1640,38 @@ class LinkDrawApp:
     def on_right_click(self, e):
         h = self.hit(e.x, e.y)
         if h and h[0] == "conn":
+            if self._layer_locked(self.model.conns[h[1]].get("layer", "Data")):
+                self.status.set("That layer is locked; unlock it in Inspector to edit this line.")
+                return
             # 20. Right-click edge context menu
             dialogs.EdgeContextMenu(self, h[1], e.x_root, e.y_root)
         elif h and h[0] == "node":
+            if self._layer_locked(self.model.nodes[h[1]].get("layer", "Data")):
+                self.status.set("That layer is locked; unlock it in Inspector to edit this node.")
+                return
             self.show_node_context_menu(h[1], e.x_root, e.y_root)
+        elif h and h[0] == "sticky":
+            note_menu = tk.Menu(self.root, tearoff=0)
+            note_menu.add_command(label="Edit Note Text...", command=lambda: self.edit_sticky_note(h[1]))
+            note_menu.add_command(label="Open Notes Window", command=lambda: self._note_window_for(sid=h[1]))
+            note_menu.add_separator()
+            note_menu.add_command(label="Delete Note", command=lambda: self.model.remove_sticky_note(h[1]))
+            note_menu.tk_popup(e.x_root, e.y_root)
 
     # ---- 9. Hover Tooltips & 65. Breadcrumbs
     def on_mouse_hover(self, e):
         h = self.hit(e.x, e.y)
+        old_hover = (self.hover_node, self.hover_conn)
         self.hover_node = h[1] if (h and h[0] == "node") else None
         self.hover_conn = h[1] if (h and h[0] == "conn") else None
         self.cur = (e.x, e.y)   # keep cur updated for eraser ghost
+        if self.tool.get() == "select":
+            cursor = "fleur" if h is None and self.drag_pan.get() == "pan" else ""
+            self.canvas.configure(cursor=cursor)
 
         self.update_breadcrumbs()
+        if old_hover != (self.hover_node, self.hover_conn) and self.mode is None:
+            self.redraw()
 
         # Eraser ghost cursor (lightweight — delete/redraw only the ghost oval)
         if self.tool.get() == "erase" and self.mode is None:
@@ -1384,6 +1753,24 @@ class LinkDrawApp:
         self.status.set(f"Mode: {t}  |  Nodes: {nodes_cnt}  |  Edges: {edges_cnt}  |  Selected: {sel_str}  |  Hover: {hover_str}")
 
     # ---- Canvas Pan / Zoom (61, 62)
+    def schedule_drag_redraw(self):
+        if self.drag_redraw_after is None:
+            self.drag_redraw_after = self.root.after(24, self._flush_drag_redraw)
+
+    def _flush_drag_redraw(self):
+        self.drag_redraw_after = None
+        if self.mode in {"drag", "drag_sticky"}:
+            self.redraw(update_minimap=False)
+
+    def cancel_drag_redraw(self):
+        if self.drag_redraw_after is None:
+            return
+        try:
+            self.root.after_cancel(self.drag_redraw_after)
+        except tk.TclError:
+            pass
+        self.drag_redraw_after = None
+
     def pan_start(self, e):
         self.pan0 = (e.x, e.y, self.ox, self.oy)
 
@@ -1452,17 +1839,339 @@ class LinkDrawApp:
         self.canvas.config(cursor=cursors.get(t, ""))
         self.update_breadcrumbs()
 
+    def set_drag_pan_mode(self, mode):
+        if mode not in {"pan", "box"}:
+            raise ValueError(f"Unsupported empty-canvas drag mode: {mode}")
+        self.drag_pan.set(mode)
+        self.model.settings["drag_pan"] = mode
+        self.model.dirty = True
+        self.dirty = True
+
     def add_node_at(self, x, y):
         self.model.push_undo()
         if self.snap_var.get():
             x, y = self.snap_val(x), self.snap_val(y)
         nid = self.model.make_node(x, y, text="New Node")
+        if hasattr(self, "sidebar"):
+            self.model.nodes[nid]["layer"] = self.sidebar.active_layer_var.get()
         self.select(nodes={nid})
         # 17. Automatically begin inline label editing
         self.edit_node_inline(nid)
 
+    def auto_detect_selected_entities(self):
+        selected = [
+            self.model.nodes[nid] for nid in self.sel_nodes
+            if nid in self.model.nodes
+        ]
+        if not selected:
+            self.status.set("Select one or more nodes to detect entity types.")
+            return
+        detections = []
+        for node in selected:
+            detected = linkdraw_investigation.detect_entity_type(node.get("text", ""))
+            if detected:
+                detections.append((node, detected))
+        if not detections:
+            self.status.set("No common entity types were detected in the selected node labels.")
+            return
+        if any(node.get("entity_type") != kind for node, kind in detections):
+            self.model.push_undo()
+            for node, kind in detections:
+                node["entity_type"] = kind
+                tags = node.setdefault("tags", [])
+                if kind.casefold() not in [tag.casefold() for tag in tags]:
+                    tags.append(kind.casefold())
+            self.dirty = True
+        self.redraw()
+        self.status.set(f"Detected entity types for {len(detections)} selected node(s).")
+
+    def add_image_node(self):
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Choose image for graph",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+        except OSError as exc:
+            messagebox.showerror("Image Error", f"Could not open image:\n{exc}", parent=self.root)
+            return
+        x, y = self.to_world(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2)
+        self.model.push_undo()
+        nid = self.model.make_node(x, y, text=os.path.basename(path), w=180, h=150)
+        self.model.nodes[nid]["image_path"] = os.path.abspath(path)
+        self.model.nodes[nid]["metadata"]["image_size"] = [width, height]
+        if hasattr(self, "sidebar"):
+            self.model.nodes[nid]["layer"] = self.sidebar.active_layer_var.get()
+        self.select(nodes={nid})
+        self.dirty = True
+        self.redraw()
+
     def edit_node_inline(self, nid):
-        dialogs.InlineTextEditor(self, nid, on_commit=self.redraw)
+        dialogs.InlineTextEditor(self, nid, on_commit=self.on_node_text_commit)
+
+    def on_node_text_commit(self):
+        self.auto_detect_selected_entities()
+        self.redraw()
+
+    def _note_window_for(self, nid=None, sid=None):
+        key = ("node", nid) if nid is not None else ("sticky", sid)
+        window = self._note_windows.get(key)
+        if window is not None and window.winfo_exists():
+            window.focus_set()
+            return
+
+        if nid is not None:
+            if nid not in self.model.nodes:
+                return
+            note = self.model.nodes[nid].setdefault("rich_notes", {"text": "", "image_path": "", "checklist": []})
+            style = note.setdefault("style", self.model.default_note_style(self.model.settings))
+            title = f"Notes for Node #{nid}"
+            initial_text = note.get("text", "")
+        else:
+            if sid not in self.model.sticky_notes:
+                return
+            note = self.model.sticky_notes[sid]
+            style = note.setdefault("style", self.model.default_note_style(self.model.settings))
+            title = f"Notes for Sticky #{sid}"
+            initial_text = note.get("text", "")
+
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("620x520")
+        win.minsize(420, 340)
+        self._note_windows[key] = win
+
+        theme_var = tk.StringVar(value=style.get("theme", self.theme.get()))
+        font_var = tk.StringVar(value=style.get("font_family", "Helvetica"))
+        size_var = tk.StringVar(value=str(style.get("font_size", 11)))
+        style_var = tk.StringVar(value=style.get("font_style", "normal"))
+        color_var = tk.StringVar(value=style.get("text_color", "#111827"))
+        highlight_var = tk.StringVar(value=style.get("highlight", "#facc15"))
+        connector_var = tk.StringVar(value=style.get("connector", "none"))
+
+        toolbar = ttk.Frame(win, padding=(8, 8, 8, 4))
+        toolbar.pack(fill="x")
+        ttk.Label(toolbar, text="Font").pack(side="left")
+        ttk.Combobox(toolbar, textvariable=font_var, values=FONT_FAMILIES, width=15, state="readonly").pack(side="left", padx=(4, 8))
+        ttk.Label(toolbar, text="Size").pack(side="left")
+        ttk.Combobox(toolbar, textvariable=size_var, values=[str(value) for value in FSIZES], width=5, state="readonly").pack(side="left", padx=(4, 8))
+        ttk.Label(toolbar, text="Style").pack(side="left")
+        ttk.Combobox(toolbar, textvariable=style_var, values=FONT_STYLES, width=12, state="readonly").pack(side="left", padx=(4, 8))
+        ttk.Label(toolbar, text="Theme").pack(side="left")
+        ttk.Combobox(toolbar, textvariable=theme_var, values=["light", "dark", "high_contrast"], width=13, state="readonly").pack(side="left", padx=(4, 0))
+
+        color_bar = ttk.Frame(win, padding=(8, 0, 8, 4))
+        color_bar.pack(fill="x")
+        ttk.Label(color_bar, text="Text color").pack(side="left")
+        ttk.Entry(color_bar, textvariable=color_var, width=11).pack(side="left", padx=(4, 2))
+        ttk.Button(color_bar, text="Pick", command=lambda: self._pick_note_color(color_var)).pack(side="left")
+        ttk.Label(color_bar, text="Highlight").pack(side="left", padx=(10, 0))
+        ttk.Entry(color_bar, textvariable=highlight_var, width=11).pack(side="left", padx=(4, 2))
+        ttk.Button(color_bar, text="Pick", command=lambda: self._pick_note_color(highlight_var)).pack(side="left")
+
+        body_frame = ttk.Frame(win, padding=(8, 0, 8, 4))
+        body_frame.pack(fill="both", expand=True)
+        body = tk.Text(body_frame, wrap="word", undo=True, padx=8, pady=8,
+                       font=(font_var.get(), int(size_var.get())))
+        body.insert("1.0", initial_text)
+        scrollbar = ttk.Scrollbar(body_frame, orient="vertical", command=body.yview)
+        body.configure(yscrollcommand=scrollbar.set)
+        body.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        body.tag_configure("note_bold", font=(font_var.get(), int(size_var.get()), "bold"))
+        body.tag_configure("note_italic", font=(font_var.get(), int(size_var.get()), "italic"))
+        body.tag_configure("note_underline", underline=True)
+        body.tag_configure("note_highlight", background=highlight_var.get())
+        for item in note.get("formatting", []):
+            try:
+                tag = item["tag"]
+                if tag.startswith("note_color_"):
+                    body.tag_configure(tag, foreground=f"#{tag.removeprefix('note_color_')}")
+                start = body.index(f"1.0 + {int(item['start'])} chars")
+                end = body.index(f"1.0 + {int(item['end'])} chars")
+                body.tag_add(tag, start, end)
+            except (KeyError, TypeError, ValueError, tk.TclError):
+                continue
+
+        formatting = ttk.Frame(win, padding=(8, 0, 8, 4))
+        formatting.pack(fill="x")
+        ttk.Button(formatting, text="Bold", command=lambda: self._toggle_note_tag(body, "note_bold")).pack(side="left")
+        ttk.Button(formatting, text="Italic", command=lambda: self._toggle_note_tag(body, "note_italic")).pack(side="left", padx=(4, 0))
+        ttk.Button(formatting, text="Underline", command=lambda: self._toggle_note_tag(body, "note_underline")).pack(side="left", padx=(4, 0))
+        ttk.Button(formatting, text="Highlight selection", command=lambda: self._apply_note_highlight(body, highlight_var)).pack(side="left", padx=(8, 0))
+        ttk.Button(formatting, text="Text color", command=lambda: self._apply_note_text_color(body, color_var)).pack(side="left", padx=(4, 0))
+
+        actions = ttk.Frame(win, padding=(8, 0, 8, 8))
+        actions.pack(fill="x")
+        if sid is not None:
+            ttk.Label(actions, text="Connector").pack(side="left")
+            ttk.Combobox(actions, textvariable=connector_var, values=["none", "straight", "arrow", "curved"], width=10, state="readonly").pack(side="left", padx=(4, 6))
+            ttk.Button(actions, text="Connect to selected node", command=lambda: self._connect_sticky_note(sid, connector_var.get())).pack(side="left")
+        ttk.Button(actions, text="Open Diagram Tree", command=lambda: dialogs.TreeView(self)).pack(side="left", padx=(6, 0))
+        ttk.Button(actions, text="Save", command=lambda: self._save_note_window(body, nid, sid, note, font_var, size_var, style_var, color_var, highlight_var, theme_var, connector_var)).pack(side="left", padx=(6, 0))
+
+        def apply_style(_event=None):
+            self._apply_note_window_style(body, font_var, size_var, style_var, color_var, highlight_var, theme_var)
+
+        save_note = lambda: self._save_note_window(
+            body, nid, sid, note, font_var, size_var, style_var,
+            color_var, highlight_var, theme_var, connector_var,
+        )
+        self._note_window_savers[key] = save_note
+
+        for variable in (font_var, size_var, style_var, color_var, highlight_var, theme_var):
+            variable.trace_add("write", lambda *_args: apply_style())
+        apply_style()
+        body.bind("<KeyRelease>", lambda _event: save_note())
+
+        def on_close():
+            save_note()
+            self._note_window_savers.pop(key, None)
+            self._note_windows.pop(key, None)
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        ttk.Button(actions, text="Close", command=on_close).pack(side="right")
+
+    def _pick_note_color(self, var):
+        color = colorchooser.askcolor(parent=self.root, initialcolor=var.get())[1]
+        if color:
+            var.set(color)
+
+    @staticmethod
+    def _toggle_note_tag(body, tag):
+        try:
+            start, end = body.index("sel.first"), body.index("sel.last")
+        except tk.TclError:
+            return
+        if tag in body.tag_names(start):
+            body.tag_remove(tag, start, end)
+        else:
+            body.tag_add(tag, start, end)
+
+    @staticmethod
+    def _apply_note_highlight(body, highlight_var):
+        try:
+            start, end = body.index("sel.first"), body.index("sel.last")
+        except tk.TclError:
+            return
+        body.tag_configure("note_highlight", background=highlight_var.get())
+        body.tag_add("note_highlight", start, end)
+
+    @staticmethod
+    def _apply_note_text_color(body, color_var):
+        try:
+            start, end = body.index("sel.first"), body.index("sel.last")
+        except tk.TclError:
+            return
+        tag = f"note_color_{color_var.get().lstrip('#')}"
+        body.tag_configure(tag, foreground=color_var.get())
+        body.tag_add(tag, start, end)
+
+    @staticmethod
+    def _apply_note_window_style(body, font_var, size_var, style_var, color_var, highlight_var, theme_var):
+        try:
+            size = int(size_var.get())
+        except ValueError:
+            return
+        weights = "bold" in style_var.get()
+        slant = "italic" in style_var.get()
+        font_style = ("bold " if weights else "") + ("italic" if slant else "")
+        font = (font_var.get(), size, font_style or "normal")
+        colors = {
+            "light": ("#ffffff", color_var.get(), color_var.get()),
+            "dark": ("#1e222b", color_var.get(), color_var.get()),
+            "high_contrast": ("#000000", color_var.get(), color_var.get()),
+        }
+        background, foreground, insert = colors.get(theme_var.get(), colors["light"])
+        body.configure(font=font, bg=background, fg=foreground, insertbackground=insert)
+        body.tag_configure("note_bold", font=(font_var.get(), size, "bold"))
+        body.tag_configure("note_italic", font=(font_var.get(), size, "italic"))
+        body.tag_configure("note_highlight", background=highlight_var.get())
+        body.tag_configure("sel", background="#2563eb", foreground="#ffffff")
+
+    def _save_note_window(self, body, nid, sid, note, font_var, size_var, style_var, color_var, highlight_var, theme_var, connector_var):
+        text = body.get("1.0", "end-1c")
+        if nid is not None and nid in self.model.nodes:
+            note = self.model.nodes[nid].setdefault("rich_notes", {"text": "", "image_path": "", "checklist": []})
+            note["text"] = text
+            style = note.setdefault("style", self.model.default_note_style(self.model.settings))
+        elif sid is not None and sid in self.model.sticky_notes:
+            note = self.model.sticky_notes[sid]
+            note["text"] = text
+            style = note.setdefault("style", self.model.default_note_style(self.model.settings))
+        else:
+            return
+
+        formatting = []
+        for tag in body.tag_names():
+            if not tag.startswith(("note_bold", "note_italic", "note_underline", "note_highlight", "note_color_")):
+                continue
+            ranges = body.tag_ranges(tag)
+            for start, end in zip(ranges[::2], ranges[1::2]):
+                start_offset = body.count("1.0", start, "chars")[0]
+                end_offset = body.count("1.0", end, "chars")[0]
+                formatting.append({"start": start_offset, "end": end_offset, "tag": tag})
+        note["formatting"] = formatting
+
+        style.update({
+            "font_family": font_var.get(),
+            "font_size": int(size_var.get()),
+            "font_style": style_var.get(),
+            "text_color": color_var.get(),
+            "highlight": highlight_var.get(),
+            "theme": theme_var.get(),
+        })
+        if sid is not None:
+            style["connector"] = connector_var.get()
+            self._connect_sticky_note(sid, connector_var.get(), redraw=False)
+        note["style"] = style
+        if nid is not None and nid in self.model.nodes:
+            self.model.nodes[nid]["highlight"] = style.get("highlight")
+            self.model.nodes[nid]["font_family"] = style.get("font_family")
+            self.model.nodes[nid]["font_style"] = style.get("font_style")
+            self.model.nodes[nid]["fs"] = int(style.get("font_size", self.model.nodes[nid].get("fs", 11)))
+        self.model.dirty = True
+        self.dirty = True
+        self.redraw()
+
+    def _connect_sticky_note(self, sid, connector, redraw=True):
+        note = self.model.sticky_notes.get(sid)
+        selected = next(iter(self.sel_nodes), None)
+        if note is None:
+            return
+        if connector == "none":
+            note.pop("connected_node_id", None)
+        elif selected is not None and selected in self.model.nodes:
+            note["connected_node_id"] = selected
+        else:
+            self.status.set("Select a node on the diagram before connecting this sticky note.")
+            return
+        self.model.dirty = True
+        self.dirty = True
+        if redraw:
+            self.redraw()
+
+    def open_node_notes(self, nid):
+        if nid not in self.model.nodes:
+            return
+        self.select(nodes={nid})
+        self._note_window_for(nid=nid)
+
+    def open_selected_element_notes(self, _event=None):
+        if self._text_input_has_focus():
+            return None
+        if self.sel_nodes:
+            for nid in sorted(self.sel_nodes):
+                self._note_window_for(nid=nid)
+        elif self.sel_sticky in self.model.sticky_notes:
+            self._note_window_for(sid=self.sel_sticky)
+        else:
+            self.status.set("Select a graph element, then press Shift+N to open its notes.")
+        return "break"
 
     def edit_selected_inline(self):
         if len(self.sel_nodes) == 1:
@@ -1505,15 +2214,29 @@ class LinkDrawApp:
 
     def delete_selected(self):
         if self.sel_conn in self.model.conns:
+            if self._layer_locked(self.model.conns[self.sel_conn].get("layer", "Data")):
+                self.status.set("That layer is locked; unlock it in Inspector before deleting.")
+                return
             self.model.push_undo()
             self.model.remove_conn(self.sel_conn)
             self.sel_conn = None
         elif self.sel_nodes:
+            deletable = [
+                nid for nid in self.sel_nodes
+                if nid in self.model.nodes
+                and not self._layer_locked(self.model.nodes[nid].get("layer", "Data"))
+            ]
+            if not deletable:
+                self.status.set("Selected elements are on locked layers.")
+                return
             self.model.push_undo()
-            for nid in list(self.sel_nodes):
+            for nid in deletable:
                 self.model.remove_node(nid)
-            self.sel_nodes.clear()
+            self.sel_nodes.difference_update(deletable)
         elif self.sel_sticky in self.model.sticky_notes:
+            if self._layer_locked(self.model.sticky_notes[self.sel_sticky].get("layer", "Annotations")):
+                self.status.set("That layer is locked; unlock it in Inspector before deleting.")
+                return
             self.model.push_undo()
             self.model.remove_sticky_note(self.sel_sticky)
             self.sel_sticky = None
@@ -1545,9 +2268,14 @@ class LinkDrawApp:
         self.select(nodes=new_nodes)
 
     def nudge_selected(self, dx, dy):
-        if self.sel_nodes:
+        movable = [
+            nid for nid in self.sel_nodes
+            if nid in self.model.nodes
+            and not self._layer_locked(self.model.nodes[nid].get("layer", "Data"))
+        ]
+        if movable:
             self.model.push_undo()
-            for nid in self.sel_nodes:
+            for nid in movable:
                 self.model.nodes[nid]["x"] += dx
                 self.model.nodes[nid]["y"] += dy
                 self.model.update_spatial_node(nid)
@@ -1567,6 +2295,7 @@ class LinkDrawApp:
             sh = self.shape_var.get()
             for nid in self.sel_nodes:
                 self.model.nodes[nid]["shape"] = sh
+            self.dirty = True
             self.redraw()
 
     def on_fs_change(self):
@@ -1575,14 +2304,53 @@ class LinkDrawApp:
             fs = int(self.fs_var.get())
             for nid in self.sel_nodes:
                 self.model.nodes[nid]["fs"] = fs
+            self.dirty = True
             self.redraw()
+        else:
+            self.model.settings["default_font_size"] = int(self.fs_var.get())
+            self.model.dirty = True
+            self.dirty = True
+
+    def on_node_font_change(self):
+        family = self.node_font_var.get()
+        if self.sel_nodes:
+            self.sidebar.set_selected_node_property("font_family", family)
+        else:
+            self.model.settings["default_font_family"] = family
+            self.model.dirty = True
+            self.dirty = True
+
+    def on_node_font_style_change(self):
+        style = self.node_font_style_var.get()
+        if self.sel_nodes:
+            self.sidebar.set_selected_node_property("font_style", style)
+        else:
+            self.model.settings["default_font_style"] = style
+            self.model.dirty = True
+            self.dirty = True
 
     def set_selected_node_color(self, col):
         if self.sel_nodes:
             self.model.push_undo()
             for nid in self.sel_nodes:
                 self.model.nodes[nid]["color"] = col
+            self.dirty = True
             self.redraw()
+        else:
+            self.model.settings["default_node_color"] = col
+            self.model.dirty = True
+            self.dirty = True
+
+    def pick_node_text_color(self):
+        nodes = [self.model.nodes[nid] for nid in self.sel_nodes if nid in self.model.nodes]
+        initial = nodes[0].get("text_color") or "#111827" if nodes else "#111827"
+        color = colorchooser.askcolor(initial, parent=self.root, title="Node Text Color")[1]
+        if color and self.sel_nodes:
+            self.sidebar.set_selected_node_property("text_color", color)
+
+    def reset_node_text_color(self):
+        if self.sel_nodes:
+            self.sidebar.set_selected_node_property("text_color", "")
 
     def pick_custom_node_color(self):
         col = colorchooser.askcolor(parent=self.root, title="Node Color")[1]
@@ -1590,22 +2358,44 @@ class LinkDrawApp:
             self.set_selected_node_color(col)
 
     def on_conn_style_change(self):
+        line_style = self.line_style_var.get()
+        self.dash_var.set(line_style != "solid")
         if self.sel_conn in self.model.conns:
             cn = self.model.conns[self.sel_conn]
             self.model.push_undo()
             cn["type"] = self.line_var.get()
             cn["arrow"] = self.arrow_var.get()
-            cn["dash"] = self.dash_var.get()
+            cn["line_style"] = line_style
+            cn["dash"] = line_style != "solid"
             cn["width"] = int(self.width_var.get())
+            cn["color"] = self.line_color_var.get()
+            self.dirty = True
             self.redraw()
+        else:
+            self.model.settings["default_line_type"] = self.line_var.get()
+            self.model.settings["default_arrow"] = self.arrow_var.get()
+            self.model.settings["default_line_style"] = line_style
+            self.model.settings["default_line_width"] = int(self.width_var.get())
+            self.model.settings["default_line_color"] = self.line_color_var.get()
+            self.model.dirty = True
+            self.dirty = True
 
     def pick_conn_color(self):
         cn = self.model.conns.get(self.sel_conn)
-        col = colorchooser.askcolor(cn["color"] if cn else "#374151", parent=self.root)[1]
-        if col and cn:
-            self.model.push_undo()
-            cn["color"] = col
-            self.redraw()
+        col = colorchooser.askcolor(
+            cn["color"] if cn else self.line_color_var.get(), parent=self.root
+        )[1]
+        if col:
+            self.line_color_var.set(col)
+            if cn:
+                self.model.push_undo()
+                cn["color"] = col
+                self.dirty = True
+                self.redraw()
+            else:
+                self.model.settings["default_line_color"] = col
+                self.model.dirty = True
+                self.dirty = True
 
     # ---- 7. Pick Node Icon (Emoji / Symbol)
     def pick_node_icon(self):
@@ -1635,6 +2425,10 @@ class LinkDrawApp:
 
     def show_node_context_menu(self, nid, x, y):
         m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Edit Text...", command=lambda: self.edit_node_inline(nid))
+        m.add_command(label="Open Notes...", command=lambda: self.open_node_notes(nid))
+        m.add_command(label="Open Notes in Window", command=lambda: self._note_window_for(nid=nid))
+        m.add_separator()
         m.add_command(label=f"Edit Metadata...", command=lambda: dialogs.NodeMetadataEditor(self, nid))
         m.add_command(label="Choose Icon...", command=self.pick_node_icon)
         m.add_separator()
@@ -1643,6 +2437,9 @@ class LinkDrawApp:
 
     # ---- 8. Animated Edge Flow Toggle
     def toggle_edge_flow(self):
+        self.model.settings["animated_flow"] = self.animated_flow_var.get()
+        self.model.dirty = True
+        self.dirty = True
         if self.animated_flow_var.get():
             self._step_flow()
         else:
@@ -1654,20 +2451,90 @@ class LinkDrawApp:
     def _step_flow(self):
         if not self.animated_flow_var.get():
             return
-        self.flow_phase = (self.flow_phase + 2) % 20
+        speed = int(self.flow_speed_var.get())
+        self.flow_phase = (self.flow_phase + speed) % 20
         self.redraw()
-        self.flow_job = self.root.after(60, self._step_flow)
+        self.flow_job = self.root.after(max(20, 120 - speed * 20), self._step_flow)
+
+    def set_flow_speed(self, speed):
+        if speed not in {1, 2, 4}:
+            raise ValueError(f"Unsupported flow speed: {speed}")
+        self.flow_speed_var.set(str(speed))
+        self.model.settings["flow_speed"] = speed
+        self.model.dirty = True
+        self.dirty = True
 
     # ---- 1. Theme Change
     def on_theme_change(self):
+        self.model.settings["theme"] = self.theme.get()
+        self.model.dirty = True
+        self.dirty = True
+        self.apply_widget_theme()
         self.update_color_swatches()
         self.redraw()
+
+    def on_view_setting_change(self):
+        self.model.settings.update({
+            "grid": self.grid_var.get(),
+            "snap": self.snap_var.get(),
+            "minimap": self.minimap_var.get(),
+            "show_legend": self.legend_var.get(),
+        })
+        self.model.dirty = True
+        self.dirty = True
+        self.redraw()
+
+    def apply_widget_theme(self):
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        if self.theme.get() == "dark":
+            colors = ("#20242c", "#292f39", "#e5e7eb", "#171a20", "#424a57", "#3b82f6")
+        elif self.theme.get() == "high_contrast":
+            colors = ("#000000", "#000000", "#ffffff", "#000000", "#ffffff", "#ffff00")
+        else:
+            colors = ("#f3f4f6", "#ffffff", "#111827", "#ffffff", "#cbd5e1", "#2563eb")
+        bg, surface, fg, field, border, accent = colors
+        style.configure(".", background=bg, foreground=fg)
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", background=bg, foreground=fg)
+        style.configure("TLabelframe", background=bg, foreground=fg)
+        style.configure("TLabelframe.Label", background=bg, foreground=fg)
+        style.configure("TNotebook", background=bg, bordercolor=border)
+        style.configure("TNotebook.Tab", background=surface, foreground=fg, padding=(8, 4))
+        style.map("TNotebook.Tab", background=[("selected", accent)], foreground=[("selected", "#ffffff")])
+        style.configure("TButton", background=surface, foreground=fg, padding=(6, 3))
+        style.map("TButton", background=[("active", accent)], foreground=[("active", "#ffffff")])
+        style.configure("TCheckbutton", background=bg, foreground=fg)
+        style.configure("TRadiobutton", background=bg, foreground=fg)
+        style.configure("TEntry", fieldbackground=field, foreground=fg)
+        style.configure("TCombobox", fieldbackground=field, foreground=fg)
+        style.configure("Treeview", background=field, fieldbackground=field, foreground=fg)
+        style.configure("Treeview.Heading", background=surface, foreground=fg)
+        style.configure("TScrollbar", background=surface, troughcolor=bg)
+        def style_native_widgets(widget):
+            if isinstance(widget, tk.Text):
+                widget.configure(
+                    bg=field, fg=fg, insertbackground=fg,
+                    selectbackground=accent, selectforeground="#ffffff",
+                )
+            elif isinstance(widget, tk.Listbox):
+                widget.configure(
+                    bg=field, fg=fg, selectbackground=accent,
+                    selectforeground="#ffffff",
+                )
+            elif isinstance(widget, tk.Canvas) and widget not in (self.canvas, self.mm):
+                widget.configure(bg=bg)
+            for child in widget.winfo_children():
+                style_native_widgets(child)
+
+        style_native_widgets(self.root)
 
     # =========================================================================
     # Layouts (21–30)
     # =========================================================================
     def apply_layout(self, kind):
-        node_ids = list(self.sel_nodes) if len(self.sel_nodes) >= 2 else list(self.model.nodes.keys())
+        node_ids = sorted(self.sel_nodes) if len(self.sel_nodes) >= 2 else list(self.model.nodes.keys())
         if len(node_ids) < 2:
             return
 
@@ -1678,6 +2545,10 @@ class LinkDrawApp:
             target_pos = layouts.compute_circular(self.model, node_ids)
         elif kind == "grid":
             target_pos = layouts.compute_grid(self.model, node_ids)
+        elif kind == "concentric":
+            target_pos = layouts.compute_concentric(self.model, node_ids)
+        elif kind == "spiral":
+            target_pos = layouts.compute_spiral(self.model, node_ids)
         elif kind == "hierarchical":
             target_pos = layouts.compute_hierarchical_sugiyama(self.model, node_ids)
         elif kind == "radial_tree":
@@ -1982,6 +2853,124 @@ class LinkDrawApp:
     def show_shortcuts(self):
         dialogs.show_shortcuts_panel(self.root)
 
+    def show_usage_guide(self):
+        win = tk.Toplevel(self.root)
+        win.title("LinkDraw Quick Start")
+        win.transient(self.root)
+        win.minsize(480, 360)
+        frame = ttk.Frame(win, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Build, style, and explore a diagram", font=("Helvetica", 14, "bold")).pack(anchor="w")
+        tips = (
+            "1. Add nodes with the Node tool or choose a shape from Elements.\n"
+            "2. Connect nodes by choosing Connect and dragging from one node to another.\n"
+            "3. Select a line to edit its route, arrow, color, width, pattern, weight, and label.\n"
+            "4. Set line options with no line selected to use them for new connections.\n"
+            "5. Select several nodes to move or recolor them together. Use Layout for automatic arrangements.\n"
+            "   Try Concentric for connection-distance rings or Topology Spiral for an expanding connected-node view.\n"
+            "6. Drag empty canvas to pan; use Inspector for layers, exact sizes, line details, and pages.\n"
+            "   Select a connection and drag its orange midpoint handle to customize its curve.\n"
+            "7. Select one or more graph elements and press Shift+N for their separate notes windows.\n"
+            "8. Shift-drag from one node to another to connect without changing tools.\n"
+            "9. View offers Tree, Timeline, and Formula Sheet views. Formulas use spreadsheet cell references.\n"
+            "10. OSINT entity detection runs locally. Breach resources open a public homepage only and never send graph data.\n"
+            "11. Save diagrams with Ctrl+S (Command+S on macOS). Export images and graph formats from File.\n\n"
+            "Useful keys: V Select · N Node · C Connect · B Draw · H Hand · Shift-drag Connect · Shift+N Notes · F Fit · Ctrl+Z Undo"
+        )
+        text = tk.Text(frame, wrap="word", height=12, padx=8, pady=8)
+        text.pack(fill="both", expand=True, pady=(10, 0))
+        text.insert("1.0", tips)
+        text.configure(state="disabled")
+        ttk.Button(frame, text="Close", command=win.destroy).pack(anchor="e", pady=(8, 0))
+
+    def copy_selected_style(self):
+        if self.sel_conn in self.model.conns:
+            connection = self.model.conns[self.sel_conn]
+            style = {
+                key: connection.get(key)
+                for key in ("type", "arrow", "color", "width")
+            }
+            style["line_style"] = connection.get(
+                "line_style", "dashed" if connection.get("dash") else "solid"
+            )
+            style["dash"] = style["line_style"] != "solid"
+            self.style_clipboard = ("connection", style)
+        elif self.sel_nodes:
+            node = self.model.nodes.get(next(iter(self.sel_nodes)))
+            if node is None:
+                return
+            keys = ("shape", "color", "fs", "icon")
+            self.style_clipboard = ("node", {key: node.get(key) for key in keys})
+        else:
+            self.status.set("Select a node or connection before copying its style.")
+            return
+        self.status.set("Style copied. Select matching objects and choose Paste Style.")
+
+    def paste_selected_style(self):
+        if not self.style_clipboard:
+            self.status.set("Copy a node or connection style first.")
+            return
+        kind, style = self.style_clipboard
+        if kind == "node" and self.sel_nodes:
+            targets = [self.model.nodes[nid] for nid in self.sel_nodes if nid in self.model.nodes]
+            if not targets:
+                return
+        elif kind == "connection" and self.sel_conn in self.model.conns:
+            targets = [self.model.conns[self.sel_conn]]
+        else:
+            self.status.set(f"Select {kind}s to apply the copied style.")
+            return
+        if all(all(target.get(key) == value for key, value in style.items()) for target in targets):
+            return
+        self.model.push_undo()
+        self.dirty = True
+        for target in targets:
+            target.update(style)
+        if kind == "connection":
+            line_style = style.get("line_style") or ("dashed" if style.get("dash") else "solid")
+            self.line_var.set(style.get("type", "curved"))
+            self.arrow_var.set(style.get("arrow", "forward"))
+            self.width_var.set(str(style.get("width", 2)))
+            self.line_style_var.set(line_style)
+            self.line_color_var.set(style.get("color", "#374151"))
+            self.dash_var.set(line_style != "solid")
+        self.redraw()
+        self.status.set(f"Applied copied {kind} style.")
+
+    def select_connected_neighbors(self):
+        if not self.sel_nodes:
+            self.status.set("Select one or more nodes first.")
+            return
+        neighbors = set(self.sel_nodes)
+        for connection in self.model.conns.values():
+            if connection["a"] in self.sel_nodes:
+                neighbors.add(connection["b"])
+            if connection["b"] in self.sel_nodes:
+                neighbors.add(connection["a"])
+        self.select(nodes=neighbors)
+        self.status.set(f"Selected {len(neighbors)} nodes, including connected neighbors.")
+
+    def select_component(self):
+        if not self.sel_nodes:
+            self.status.set("Select a node first.")
+            return
+        component = set(self.sel_nodes)
+        frontier = list(self.sel_nodes)
+        while frontier:
+            current = frontier.pop()
+            for connection in self.model.conns.values():
+                if connection["a"] == current:
+                    neighbor = connection["b"]
+                elif connection["b"] == current:
+                    neighbor = connection["a"]
+                else:
+                    continue
+                if neighbor in self.model.nodes and neighbor not in component:
+                    component.add(neighbor)
+                    frontier.append(neighbor)
+        self.select(nodes=component)
+        self.status.set(f"Selected the connected component ({len(component)} nodes).")
+
     def show_about(self):
         messagebox.showinfo("About LinkDraw Pro",
                             "LinkDraw Pro\nAdvanced Network & Graph Visualization Canvas\n70 Features Implemented.")
@@ -1996,8 +2985,12 @@ class LinkDrawApp:
         if not q:
             self.clear_highlights()
             return
-        matches = [nid for nid, n in self.model.nodes.items()
-                   if q in n["text"].lower() or any(q in t.lower() for t in n.get("tags", []))]
+        matches = [
+            nid for nid, n in self.model.nodes.items()
+            if q in n.get("text", "").lower()
+            or q in n.get("entity_type", "").lower()
+            or any(q in tag.lower() for tag in n.get("tags", []))
+        ]
         for nid, n in self.model.nodes.items():
             n["highlight"] = "#eab308" if nid in matches else None
         self.redraw()
@@ -2006,8 +2999,12 @@ class LinkDrawApp:
         q = self.search_var.get().strip().lower()
         if not q:
             return
-        matches = [nid for nid, n in self.model.nodes.items()
-                   if q in n["text"].lower() or any(q in t.lower() for t in n.get("tags", []))]
+        matches = [
+            nid for nid, n in self.model.nodes.items()
+            if q in n.get("text", "").lower()
+            or q in n.get("entity_type", "").lower()
+            or any(q in tag.lower() for tag in n.get("tags", []))
+        ]
         if matches:
             self.select(nodes=set(matches))
             # Center on first match
@@ -2027,6 +3024,7 @@ class LinkDrawApp:
         if self.dirty and not messagebox.askyesno("Unsaved Changes", "Discard unsaved changes?"):
             return
         self.model = GraphModel()
+        self.sync_document_settings()
         self.path = None
         self.dirty = False
         self.select()
@@ -2043,6 +3041,7 @@ class LinkDrawApp:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
             self.model.load_dict(d)
+            self.sync_document_settings()
             self.path = path
             self.dirty = False
             io_manager.add_recent_file(path)
@@ -2056,6 +3055,17 @@ class LinkDrawApp:
         if not self.path:
             return self.save_as()
         try:
+            self.model.settings["drag_pan"] = self.drag_pan.get()
+            self.model.settings.update({
+                "theme": self.theme.get(),
+                "grid": self.grid_var.get(),
+                "snap": self.snap_var.get(),
+                "minimap": self.minimap_var.get(),
+                "animated_flow": self.animated_flow_var.get(),
+                "show_legend": self.legend_var.get(),
+                "flow_speed": int(self.flow_speed_var.get()),
+            })
+            self.sidebar.page_manager.persist()
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(self.model.to_dict(), f, indent=2)
             self.dirty = False
@@ -2071,6 +3081,41 @@ class LinkDrawApp:
         if p:
             self.path = p
             self.save_doc()
+
+    def sync_document_settings(self):
+        settings = self.model.settings
+        self.theme.set(settings.get("theme", "light"))
+        self.grid_var.set(settings.get("grid", True))
+        self.snap_var.set(settings.get("snap", True))
+        self.minimap_var.set(settings.get("minimap", True))
+        self.animated_flow_var.set(settings.get("animated_flow", False))
+        self.legend_var.set(settings.get("show_legend", False))
+        self.line_var.set(settings.get("default_line_type", "curved"))
+        self.arrow_var.set(settings.get("default_arrow", "forward"))
+        self.width_var.set(str(settings.get("default_line_width", 2)))
+        line_style = settings.get("default_line_style", "solid")
+        self.line_style_var.set(line_style)
+        self.dash_var.set(line_style != "solid")
+        self.line_color_var.set(settings.get("default_line_color", "#374151"))
+        self.fs_var.set(str(settings.get("default_font_size", 11)))
+        self.node_font_var.set(settings.get("default_font_family", "Helvetica"))
+        self.node_font_style_var.set(settings.get("default_font_style", "normal"))
+        self.drag_pan.set(settings.get("drag_pan", "pan"))
+        self.flow_speed_var.set(str(settings.get("flow_speed", 2)))
+        if hasattr(self, "sidebar"):
+            self.sidebar.layer_manager = drawing_tools.LayerManager(self.model)
+            self.sidebar.page_manager = drawing_tools.PageManager(self.model)
+            self.sidebar.page_var.set(self.sidebar.page_manager.current_page)
+            self.sidebar.page_combo.configure(values=list(self.sidebar.page_manager.pages))
+            brand_colors = settings.get("brand_colors")
+            if isinstance(brand_colors, list) and brand_colors:
+                self.sidebar.brand_kit.colors = list(brand_colors)
+            else:
+                self.sidebar.brand_kit.colors = drawing_tools.BrandKit().colors
+            self.sidebar.refresh_brand_swatches()
+            self.sidebar.refresh_inspector_palette()
+        self.update_color_swatches()
+        self.on_theme_change()
 
     # ---- Import / Export Handlers
     def export_svg(self):
@@ -2218,6 +3263,13 @@ class LinkDrawApp:
         self.fit()
 
     def on_close(self):
+        for key, save_note in list(self._note_window_savers.items()):
+            window = self._note_windows.get(key)
+            if window is not None and window.winfo_exists():
+                save_note()
+        if not self.sidebar.flush_pending_notes():
+            return
+        self.sidebar.page_manager.persist()
         io_manager.save_autosave(self.model)
         self.root.destroy()
 

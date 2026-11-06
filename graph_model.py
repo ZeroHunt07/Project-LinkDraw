@@ -3,6 +3,7 @@ Graph data model, nodes, edges, sticky notes, undo/redo manager, and serializati
 """
 import copy
 import json
+from datetime import datetime, timezone
 from spatial_index import SpatialGrid
 
 NODE_COLORS_LIGHT = ["#ffffff", "#dbeafe", "#dcfce7", "#fef9c3", "#fee2e2", "#ede9fe", "#fed7aa", "#ccfbf1"]
@@ -15,9 +16,20 @@ LINE_COLORS_HC = ["#ffffff", "#ffff00", "#00ffff", "#ff00ff", "#00ff00", "#ff880
 
 SHAPES = ["rounded", "rectangle", "square", "circle", "diamond", "hexagon", "triangle", "star", "text", "cloud", "callout", "cylinder", "parallelogram"]
 LINE_TYPES = ["straight", "curved", "elbow", "orthogonal"]
+LINE_STYLES = ["solid", "dashed", "dotted", "dash-dot", "long-dash", "dash-dot-dot"]
+LINE_DASH_PATTERNS = {
+    "solid": None,
+    "dashed": (8, 5),
+    "dotted": (2, 4),
+    "dash-dot": (8, 4, 2, 4),
+    "long-dash": (12, 5),
+    "dash-dot-dot": (8, 3, 2, 3, 2, 3),
+}
 ARROWS = ["none", "forward", "backward", "both", "diamond", "circle", "crowfoot"]
 WIDTHS = ["1", "2", "3", "4", "6"]
 FSIZES = ["9", "11", "13", "16", "20", "28"]
+FONT_FAMILIES = ["Helvetica", "Arial", "Courier New", "Times New Roman"]
+FONT_STYLES = ["normal", "bold", "italic", "bold italic"]
 
 
 class GraphModel:
@@ -40,6 +52,7 @@ class GraphModel:
             "drag_pan": "box",
             "minimap": True,
             "animated_flow": False,
+            "flow_speed": 2,
             "show_legend": False,
             "show_tooltips": True,
             "lazy_edges": True,
@@ -47,9 +60,25 @@ class GraphModel:
             "default_node_color": NODE_COLORS_LIGHT[1],
             "default_shape": "rounded",
             "default_font_size": 11,
+            "default_font_family": "Helvetica",
+            "default_font_style": "normal",
             "default_node_w": 130,
             "default_node_h": 60,
+            "default_line_color": LINE_COLORS_LIGHT[0],
+            "default_line_width": 2,
+            "default_line_type": "curved",
+            "default_arrow": "forward",
+            "default_line_style": "solid",
+            "drag_pan": "pan",
+            "layers": {
+                "Background": {"visible": True, "locked": False, "order": 0},
+                "Data": {"visible": True, "locked": False, "order": 1},
+                "Annotations": {"visible": True, "locked": False, "order": 2},
+            },
+            "brand_colors": ["#2563eb", "#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#111827", "#ffffff"],
         }
+        self.document_pages = {}
+        self.current_page = "Page 1"
 
         # Undo / redo
         self.undo_stack = []
@@ -62,6 +91,37 @@ class GraphModel:
         return i
 
     # ---- Node operations
+    @staticmethod
+    def default_note_style(settings=None):
+        settings = settings or {}
+        return {
+            "font_family": settings.get("default_font_family", "Helvetica"),
+            "font_size": settings.get("default_font_size", 11),
+            "font_style": settings.get("default_font_style", "normal"),
+            "text_color": "#111827",
+            "highlight": "#facc15",
+            "theme": settings.get("theme", "light"),
+            "connector": "none",
+            "tree": "none",
+        }
+
+    def ensure_note_style(self, nid):
+        node = self.nodes.get(nid)
+        if node is None:
+            return {}
+        rich = node.get("rich_notes")
+        if not isinstance(rich, dict):
+            rich = {"text": "", "image_path": "", "checklist": []}
+            node["rich_notes"] = rich
+        rich.setdefault("text", "")
+        rich.setdefault("image_path", "")
+        rich.setdefault("checklist", [])
+        style = rich.setdefault("style", self.default_note_style(self.settings))
+        defaults = self.default_note_style(self.settings)
+        for key, value in defaults.items():
+            style.setdefault(key, value)
+        return style
+
     def make_node(self, x, y, text="Node", shape=None, color=None, w=None, h=None, fs=None, tags=None, metadata=None, icon=""):
         nid = self.new_id()
         w = w or self.settings["default_node_w"]
@@ -75,17 +135,30 @@ class GraphModel:
             "y": float(y),
             "w": float(w),
             "h": float(h),
+            "auto_size_label": True,
             "text": str(text),
             "shape": shape,
             "color": color,
             "fs": int(fs),
+            "layer": "Data",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "image_path": "",
+            "font_family": self.settings["default_font_family"],
+            "font_style": self.settings["default_font_style"],
+            "text_color": "",
             "tags": list(tags) if tags else [],
             "metadata": dict(metadata) if metadata else {},
             "icon": icon or "",
             "badge": "",
             "highlight": None,
             "entity_type": "",
-            "rich_notes": {"text": "", "image_path": "", "checklist": []},
+            "value": 0.0,
+            "rich_notes": {
+                "text": "",
+                "image_path": "",
+                "checklist": [],
+                "style": self.default_note_style(self.settings),
+            },
         }
         self.nodes[nid] = node
         self.update_spatial_node(nid)
@@ -107,20 +180,27 @@ class GraphModel:
                 self.remove_conn(cid)
 
     # ---- Edge operations
-    def make_conn(self, a, b, label="", type_=None, arrow="forward", color=None, width=2, weight=1.0, dash=False):
+    def make_conn(
+        self, a, b, label="", type_=None, arrow=None, color=None, width=None,
+        weight=1.0, dash=False, line_style=None,
+    ):
         cid = self.new_id()
-        color = color or LINE_COLORS_LIGHT[0]
+        line_style = line_style or ("dashed" if dash else self.settings["default_line_style"])
+        color = color or self.settings["default_line_color"] or LINE_COLORS_LIGHT[0]
         conn = {
             "id": cid,
             "a": a,
             "b": b,
-            "type": type_ or "curved",
-            "arrow": arrow,
-            "dash": bool(dash),
+            "type": type_ or self.settings["default_line_type"],
+            "arrow": arrow or self.settings["default_arrow"],
+            "dash": line_style != "solid",
+            "line_style": line_style,
             "color": color,
             "label": str(label),
-            "width": int(width),
+            "width": int(width or self.settings["default_line_width"]),
             "weight": float(weight),
+            "bend": 0.0,
+            "layer": self.nodes.get(a, {}).get("layer", "Data"),
             "highlight": None,
             "flow": None,
         }
@@ -157,6 +237,7 @@ class GraphModel:
             "h": float(h),
             "text": str(text),
             "color": color,
+            "layer": "Annotations",
         }
         self.sticky_notes[sid] = note
         self.update_spatial_sticky(sid)
@@ -205,6 +286,7 @@ class GraphModel:
             "sticky_notes": list(self.sticky_notes.values()),
             "freehand_strokes": list(self.freehand_strokes),
             "next_id": self.next_id,
+            "_undo_snapshot": True,
         })
 
     def push_undo(self):
@@ -237,6 +319,15 @@ class GraphModel:
         self.load_dict(d)
 
     def load_dict(self, d):
+        self.settings.update(d.get("settings", {}))
+        if "pages" in d:
+            self.document_pages = copy.deepcopy(d.get("pages", {}))
+        elif not d.get("_undo_snapshot"):
+            self.document_pages = {}
+        if "current_page" in d:
+            self.current_page = d["current_page"]
+        elif not d.get("_undo_snapshot"):
+            self.current_page = "Page 1"
         self.nodes.clear()
         self.conns.clear()
         self.sticky_notes.clear()
@@ -245,27 +336,46 @@ class GraphModel:
         for n in d.get("nodes", []):
             n.setdefault("w", 130)
             n.setdefault("h", 60)
+            n.setdefault("auto_size_label", True)
             n.setdefault("shape", "rounded")
             n.setdefault("color", NODE_COLORS_LIGHT[1])
             n.setdefault("text", "")
+            n.setdefault("layer", "Data")
+            n.setdefault("created_at", "Unknown")
+            n.setdefault("image_path", "")
             n.setdefault("fs", 11)
+            n.setdefault("font_family", self.settings["default_font_family"])
+            n.setdefault("font_style", self.settings["default_font_style"])
+            n.setdefault("text_color", "")
             n.setdefault("tags", [])
             n.setdefault("metadata", {})
             n.setdefault("icon", "")
             n.setdefault("badge", "")
             n.setdefault("highlight", None)
             n.setdefault("entity_type", "")
-            n.setdefault("rich_notes", {"text": "", "image_path": "", "checklist": []})
+            rich = n.setdefault("rich_notes", {"text": "", "image_path": "", "checklist": []})
+            if not isinstance(rich, dict):
+                rich = {"text": "", "image_path": "", "checklist": []}
+                n["rich_notes"] = rich
+            rich.setdefault("text", "")
+            rich.setdefault("image_path", "")
+            rich.setdefault("checklist", [])
+            rich.setdefault("style", self.default_note_style(self.settings))
+            for key, value in self.default_note_style(self.settings).items():
+                rich["style"].setdefault(key, value)
             self.nodes[n["id"]] = n
 
         for c in d.get("conns", []):
             c.setdefault("type", "curved")
             c.setdefault("arrow", "forward")
             c.setdefault("dash", False)
+            c.setdefault("line_style", "dashed" if c.get("dash") else "solid")
             c.setdefault("color", LINE_COLORS_LIGHT[0])
             c.setdefault("label", "")
             c.setdefault("width", 2)
             c.setdefault("weight", 1.0)
+            c.setdefault("bend", 0.0)
+            c.setdefault("layer", self.nodes.get(c.get("a"), {}).get("layer", "Data"))
             c.setdefault("highlight", None)
             c.setdefault("flow", None)
             self.conns[c["id"]] = c
@@ -275,9 +385,16 @@ class GraphModel:
             s.setdefault("h", 100)
             s.setdefault("text", "Note")
             s.setdefault("color", "#fef08a")
+            s.setdefault("layer", "Annotations")
             self.sticky_notes[s["id"]] = s
 
         used_ids = list(self.nodes) + list(self.conns) + list(self.sticky_notes)
+        for page in self.document_pages.values():
+            for collection in ("nodes", "conns", "sticky_notes"):
+                used_ids.extend(
+                    int(item_id)
+                    for item_id in page.get(collection, {})
+                )
         self.next_id = max([d.get("next_id", 1)] + [i + 1 for i in used_ids])
         self.rebuild_spatial_index()
 
@@ -289,6 +406,8 @@ class GraphModel:
             "freehand_strokes": list(self.freehand_strokes),
             "next_id": self.next_id,
             "settings": dict(self.settings),
+            "pages": copy.deepcopy(self.document_pages),
+            "current_page": self.current_page,
         }
 
     def clone_subgraph(self, node_ids, offset=40):
@@ -326,4 +445,3 @@ class GraphModel:
         for c in self.conns.values():
             c["highlight"] = None
             c["flow"] = None
-

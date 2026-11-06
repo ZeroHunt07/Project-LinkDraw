@@ -208,7 +208,8 @@ def strongly_connected_components(model):
 # ---- 39. Centrality Metrics
 def compute_centrality(model, metric="degree"):
     """
-    Computes centrality metric: 'degree', 'betweenness', 'closeness', 'eigenvector'.
+    Computes centrality metric: 'degree', 'betweenness', 'closeness',
+    'eigenvector', or 'pagerank'.
     Returns {node_id: score}.
     """
     G = to_networkx(model, directed=True)
@@ -223,6 +224,34 @@ def compute_centrality(model, metric="degree"):
             return nx.eigenvector_centrality(G, max_iter=500, weight="weight")
         except Exception:
             return nx.degree_centrality(G)
+    elif metric == "pagerank":
+        node_ids = list(G)
+        node_count = len(node_ids)
+        outgoing = {node_id: {} for node_id in node_ids}
+        for source, target, data in G.edges(data=True):
+            outgoing[source][target] = data.get("weight", 1.0)
+
+        scores = {node_id: 1.0 / node_count for node_id in node_ids}
+        for _ in range(100):
+            dangling_score = sum(
+                scores[node_id] for node_id in node_ids if not outgoing[node_id]
+            )
+            updated = {
+                node_id: (1.0 - 0.85) / node_count
+                + 0.85 * dangling_score / node_count
+                for node_id in node_ids
+            }
+            for source, targets in outgoing.items():
+                total_weight = sum(targets.values())
+                if total_weight:
+                    for target, weight in targets.items():
+                        updated[target] += 0.85 * scores[source] * weight / total_weight
+
+            if sum(abs(updated[node_id] - scores[node_id]) for node_id in node_ids) < 1e-6 * node_count:
+                return updated
+            scores = updated
+
+        raise nx.PowerIterationFailedConvergence(100)
     else:  # degree
         return nx.degree_centrality(G)
 

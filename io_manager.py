@@ -3,9 +3,11 @@ Data Import/Export, Formats, Vector & Raster Rendering, Clipboard, and Autosave.
 Covers features 10, 41–43, 47–50.
 """
 import csv
+import base64
 import io
 import json
 import math
+import mimetypes
 import os
 import pickle
 import subprocess
@@ -13,6 +15,7 @@ import sys
 from xml.sax.saxutils import escape
 import networkx as nx
 from PIL import Image, ImageDraw, ImageFont
+from graph_model import LINE_DASH_PATTERNS
 
 AUTOSAVE_PATH = os.path.join(os.path.expanduser("~"), ".linkdraw_autosave.json")
 RECENT_PATH = os.path.join(os.path.expanduser("~"), ".linkdraw_recent.json")
@@ -28,6 +31,21 @@ def get_recent_files():
     except Exception:
         pass
     return []
+
+
+def _layer_is_visible(model, layer_name):
+    return model.settings.get("layers", {}).get(layer_name, {}).get("visible", True)
+
+
+def _connection_is_visible(model, connection):
+    a = model.nodes.get(connection.get("a"))
+    b = model.nodes.get(connection.get("b"))
+    return (
+        _layer_is_visible(model, connection.get("layer", "Data"))
+        and a is not None and b is not None
+        and _layer_is_visible(model, a.get("layer", "Data"))
+        and _layer_is_visible(model, b.get("layer", "Data"))
+    )
 
 
 def add_recent_file(path):
@@ -91,12 +109,16 @@ def export_csv(model, node_csv_path, edge_csv_path):
 
     with open(edge_csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["id", "source", "target", "weight", "label", "type", "arrow", "color", "width", "dash"])
+        writer.writerow([
+            "id", "source", "target", "weight", "label", "type", "arrow",
+            "color", "width", "dash", "line_style",
+        ])
         for c in model.conns.values():
             writer.writerow([
                 c["id"], c["a"], c["b"], c.get("weight", 1.0),
                 c.get("label", ""), c.get("type", "curved"), c.get("arrow", "forward"),
-                c.get("color", "#374151"), c.get("width", 2), c.get("dash", False)
+                c.get("color", "#374151"), c.get("width", 2), c.get("dash", False),
+                c.get("line_style", "dashed" if c.get("dash") else "solid"),
             ])
 
 
@@ -151,6 +173,7 @@ def import_csv(model, node_csv_path=None, edge_csv_path=None):
                             width=int(row.get("width", 2)),
                             weight=float(row.get("weight", 1.0)),
                             dash=row.get("dash", "false").lower() in ("true", "1"),
+                            line_style=row.get("line_style") or None,
                         )
                 except Exception as e:
                     print("Error importing edge row:", e)
@@ -164,7 +187,9 @@ def export_graphml(model, filepath):
                    shape=str(n["shape"]), color=str(n["color"]), tags=",".join(n.get("tags", [])))
     for cid, c in model.conns.items():
         G.add_edge(str(c["a"]), str(c["b"]), id=str(cid), weight=float(c.get("weight", 1.0)),
-                   label=str(c.get("label", "")), type=str(c.get("type", "curved")))
+                   label=str(c.get("label", "")), type=str(c.get("type", "curved")),
+                   arrow=str(c.get("arrow", "forward")), color=str(c.get("color", "#374151")),
+                   width=int(c.get("width", 2)), line_style=str(c.get("line_style", "dashed" if c.get("dash") else "solid")))
     nx.write_graphml(G, filepath)
 
 
@@ -192,7 +217,11 @@ def import_graphml(model, filepath):
                 b=id_map[v],
                 label=str(data.get("label", "")),
                 type_=str(data.get("type", "curved")),
-                weight=float(data.get("weight", 1.0))
+                arrow=str(data.get("arrow", "forward")),
+                color=str(data.get("color", "#374151")),
+                width=int(data.get("width", 2)),
+                weight=float(data.get("weight", 1.0)),
+                line_style=str(data.get("line_style", "dashed" if data.get("dash") else "solid")),
             )
 
 
@@ -202,7 +231,10 @@ def export_gexf(model, filepath):
         G.add_node(str(nid), label=str(n["text"]), x=float(n["x"]), y=float(n["y"]))
     for cid, c in model.conns.items():
         G.add_edge(str(c["a"]), str(c["b"]), id=str(cid), weight=float(c.get("weight", 1.0)),
-                   label=str(c.get("label", "")))
+                   label=str(c.get("label", "")), type=str(c.get("type", "curved")),
+                   arrow=str(c.get("arrow", "forward")), color=str(c.get("color", "#374151")),
+                   width=int(c.get("width", 2)),
+                   line_style=str(c.get("line_style", "dashed" if c.get("dash") else "solid")))
     nx.write_gexf(G, filepath)
 
 
@@ -222,7 +254,17 @@ def import_gexf(model, filepath):
 
     for u, v, data in G.edges(data=True):
         if u in id_map and v in id_map:
-            model.make_conn(a=id_map[u], b=id_map[v], label=str(data.get("label", "")))
+            model.make_conn(
+                a=id_map[u],
+                b=id_map[v],
+                label=str(data.get("label", "")),
+                type_=str(data.get("type", "curved")),
+                arrow=str(data.get("arrow", "forward")),
+                color=str(data.get("color", "#374151")),
+                width=int(data.get("width", 2)),
+                weight=float(data.get("weight", 1.0)),
+                line_style=str(data.get("line_style", "solid")),
+            )
 
 
 # ---- 43. DOT / Graphviz Import & Export
@@ -233,7 +275,18 @@ def export_dot(model, filepath):
         lines.append(f'  "{nid}" [label="{lbl}", fillcolor="{n["color"]}", shape="{n["shape"]}"];')
     for cid, c in model.conns.items():
         lbl = c.get("label", "").replace('"', '\\"')
-        lines.append(f'  "{c["a"]}" -> "{c["b"]}" [label="{lbl}", color="{c["color"]}"];')
+        line_style = c.get("line_style", "dashed" if c.get("dash") else "solid")
+        dot_style = {
+            "dashed": "dashed",
+            "dotted": "dotted",
+            "dash-dot": "dashed",
+            "long-dash": "dashed",
+            "dash-dot-dot": "dotted",
+        }.get(line_style, "solid")
+        lines.append(
+            f'  "{c["a"]}" -> "{c["b"]}" [label="{lbl}", color="{c["color"]}", '
+            f'penwidth="{c.get("width", 2)}", style="{dot_style}"];'
+        )
     lines.append("}")
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -262,7 +315,18 @@ def import_dot(model, filepath):
                 tgt = edge.get_destination().strip('"')
                 if src in id_map and tgt in id_map:
                     lbl = (edge.get_label() or "").strip('"')
-                    model.make_conn(id_map[src], id_map[tgt], label=lbl)
+                    line_style = (edge.get_style() or "solid").strip('"')
+                    line_style = {"dashed": "dashed", "dotted": "dotted"}.get(
+                        line_style, "solid"
+                    )
+                    model.make_conn(
+                        id_map[src],
+                        id_map[tgt],
+                        label=lbl,
+                        color=(edge.get_color() or "#374151").strip('"'),
+                        width=int(float((edge.get_penwidth() or 2))),
+                        line_style=line_style,
+                    )
             # Apply auto layout
             from layouts import compute_fruchterman_reingold
             pos = compute_fruchterman_reingold(model, list(model.nodes.keys()))
@@ -370,7 +434,11 @@ def get_conn_geom(model, cn, parallel_index=0, parallel_total=1):
 
     # Parallel edge curvature offset (Bundling / separation)
     offset_mag = 0.0
-    if parallel_total > 1:
+    custom_bend = float(cn.get("bend", 0.0))
+    if abs(custom_bend) > 0.5:
+        t = "curved"
+        offset_mag = custom_bend
+    elif parallel_total > 1:
         # alternating offsets: +35, -35, +70, -70...
         step = (parallel_index - (parallel_total - 1) / 2.0) * 36.0
         offset_mag = step
@@ -441,6 +509,8 @@ def export_svg(model, filepath):
 
     # Freehand Strokes (Draw & Brush)
     for st in getattr(model, "freehand_strokes", []):
+        if not _layer_is_visible(model, st.get("layer", "Data")):
+            continue
         pts = st.get("points", [])
         if len(pts) >= 2:
             d = "M" + " L".join(f"{px:.1f} {py:.1f}" for px, py in pts)
@@ -449,6 +519,8 @@ def export_svg(model, filepath):
 
     # Sticky Notes
     for s in model.sticky_notes.values():
+        if not _layer_is_visible(model, s.get("layer", "Annotations")):
+            continue
         sx, sy, sw, sh = s["x"], s["y"], s["w"], s["h"]
         out.append(f'<rect x="{sx - sw/2:.1f}" y="{sy - sh/2:.1f}" width="{sw:.1f}" height="{sh:.1f}" '
                    f'fill="{s["color"]}" stroke="#eab308" stroke-width="1.5" rx="4"/>')
@@ -458,7 +530,7 @@ def export_svg(model, filepath):
     # Group parallel edges
     edge_pairs = {}
     for cid, c in model.conns.items():
-        if c["a"] in model.nodes and c["b"] in model.nodes:
+        if _connection_is_visible(model, c):
             pair = tuple(sorted([c["a"], c["b"]]))
             edge_pairs.setdefault(pair, []).append(cid)
 
@@ -476,7 +548,9 @@ def export_svg(model, filepath):
                 mk += f' marker-end="url(#m{c_clean})"'
             if cn.get("arrow") in ("backward", "both"):
                 mk += f' marker-start="url(#m{c_clean})"'
-            dash = ' stroke-dasharray="6 4"' if cn.get("dash") else ""
+            line_style = cn.get("line_style", "dashed" if cn.get("dash") else "solid")
+            dash_pattern = LINE_DASH_PATTERNS.get(line_style)
+            dash = f' stroke-dasharray="{" ".join(map(str, dash_pattern))}"' if dash_pattern else ""
             out.append(f'<path d="{d}" fill="none" stroke="{cn.get("color", "#374151")}" '
                        f'stroke-width="{cn.get("width", 2)}"{dash}{mk}/>')
 
@@ -491,6 +565,8 @@ def export_svg(model, filepath):
 
     # Nodes
     for n in model.nodes.values():
+        if not _layer_is_visible(model, n.get("layer", "Data")):
+            continue
         x, y, w, h = n["x"], n["y"], n["w"], n["h"]
         hw, hh = w / 2.0, h / 2.0
         sh = n.get("shape", "rounded")
@@ -538,8 +614,28 @@ def export_svg(model, filepath):
         if n.get("icon"):
             txt = f"{n['icon']} {txt}"
         fs = n.get("fs", 11)
-        out.append(f'<text x="{x:.1f}" y="{y + 4:.1f}" text-anchor="middle" font-size="{fs}" fill="#111827">'
-                   f'{escape(txt)}</text>')
+        image_path = n.get("image_path")
+        text_y = y + (hh * 0.65 if image_path and os.path.isfile(image_path) else 4)
+        if image_path and os.path.isfile(image_path):
+            mime_type = mimetypes.guess_type(image_path)[0] or "application/octet-stream"
+            with open(image_path, "rb") as image_file:
+                encoded_image = base64.b64encode(image_file.read()).decode("ascii")
+            out.append(
+                f'<image x="{x - hw + 6:.1f}" y="{y - hh + 6:.1f}" '
+                f'width="{max(1, w - 12):.1f}" height="{max(1, h * 0.55):.1f}" '
+                f'preserveAspectRatio="xMidYMid meet" '
+                f'href="data:{mime_type};base64,{encoded_image}"/>'
+            )
+        font_family = escape(n.get("font_family", "Helvetica"), {'"': "&quot;"})
+        font_style = n.get("font_style", "normal")
+        font_weight = "bold" if "bold" in font_style else "normal"
+        font_slant = "italic" if "italic" in font_style else "normal"
+        text_color = n.get("text_color") or "#111827"
+        out.append(
+            f'<text x="{x:.1f}" y="{text_y:.1f}" text-anchor="middle" font-size="{fs}" '
+            f'font-family="{font_family}" font-weight="{font_weight}" '
+            f'font-style="{font_slant}" fill="{text_color}">{escape(txt)}</text>'
+        )
 
     out.append("</svg>")
     with open(filepath, "w", encoding="utf-8") as f:
@@ -556,8 +652,82 @@ def export_raster(model, filepath, kind="png"):
     def P(x, y):
         return ((x - x0) * S, (y - y0) * S)
 
-    def get_font(size):
-        for name in ("DejaVuSans.ttf", "Arial.ttf", "LiberationSans-Regular.ttf"):
+    def draw_styled_line(points, fill, width, line_style):
+        pattern = LINE_DASH_PATTERNS.get(line_style)
+        if not pattern:
+            draw.line(points, fill=fill, width=width, joint="curve")
+            return
+        pattern = [max(1, round(length * S)) for length in pattern]
+        for start, end in zip(points, points[1:]):
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length = math.hypot(dx, dy)
+            if length == 0:
+                continue
+            cursor = 0.0
+            pattern_index = 0
+            while cursor < length:
+                segment_end = min(length, cursor + pattern[pattern_index])
+                if pattern_index % 2 == 0:
+                    p1 = (start[0] + dx * cursor / length, start[1] + dy * cursor / length)
+                    p2 = (start[0] + dx * segment_end / length, start[1] + dy * segment_end / length)
+                    draw.line((p1, p2), fill=fill, width=width)
+                cursor = segment_end
+                pattern_index = (pattern_index + 1) % len(pattern)
+
+    def get_font(size, family="Helvetica", style="normal"):
+        family_key = family.casefold()
+        if family_key == "courier new":
+            regular = ("Courier New.ttf", "LiberationMono-Regular.ttf", "DejaVuSansMono.ttf")
+            bold = ("Courier New Bold.ttf", "LiberationMono-Bold.ttf", "DejaVuSansMono-Bold.ttf")
+            italic = ("Courier New Italic.ttf", "LiberationMono-Italic.ttf", "DejaVuSansMono-Oblique.ttf")
+            bold_italic = (
+                "Courier New Bold Italic.ttf",
+                "LiberationMono-BoldItalic.ttf",
+                "DejaVuSansMono-BoldOblique.ttf",
+            )
+        elif family_key == "times new roman":
+            regular = ("Times New Roman.ttf", "LiberationSerif-Regular.ttf", "DejaVuSerif.ttf")
+            bold = ("Times New Roman Bold.ttf", "LiberationSerif-Bold.ttf", "DejaVuSerif-Bold.ttf")
+            italic = ("Times New Roman Italic.ttf", "LiberationSerif-Italic.ttf", "DejaVuSerif-Italic.ttf")
+            bold_italic = (
+                "Times New Roman Bold Italic.ttf",
+                "LiberationSerif-BoldItalic.ttf",
+                "DejaVuSerif-BoldItalic.ttf",
+            )
+        else:
+            regular = ("Helvetica.ttf", "Arial.ttf", "LiberationSans-Regular.ttf", "DejaVuSans.ttf")
+            bold = ("Arial_Bold.ttf", "arialbd.ttf", "LiberationSans-Bold.ttf", "DejaVuSans-Bold.ttf")
+            italic = ("Arial_Italic.ttf", "ariali.ttf", "LiberationSans-Italic.ttf", "DejaVuSans-Oblique.ttf")
+            bold_italic = (
+                "Arial_BoldItalic.ttf",
+                "arialbi.ttf",
+                "LiberationSans-BoldItalic.ttf",
+                "DejaVuSans-BoldOblique.ttf",
+            )
+        candidates = {
+            "normal": regular,
+            "bold": bold,
+            "italic": italic,
+            "bold italic": bold_italic,
+        }.get(style, regular)
+        if sys.platform == "win32":
+            font_directories = [os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")]
+        elif sys.platform == "darwin":
+            font_directories = ["/System/Library/Fonts", "/Library/Fonts"]
+        else:
+            font_directories = [
+                "/usr/share/fonts/truetype/liberation2",
+                "/usr/share/fonts/truetype/liberation",
+                "/usr/share/fonts/truetype/dejavu",
+                "/usr/share/fonts/truetype/msttcorefonts",
+                "/usr/share/fonts",
+            ]
+        font_paths = [
+            os.path.join(directory, name)
+            for directory in font_directories
+            for name in candidates
+        ]
+        for name in (*font_paths, *candidates):
             try:
                 return ImageFont.truetype(name, int(size * S))
             except OSError:
@@ -566,12 +736,16 @@ def export_raster(model, filepath, kind="png"):
 
     # Freehand Strokes (Draw & Brush)
     for st in getattr(model, "freehand_strokes", []):
+        if not _layer_is_visible(model, st.get("layer", "Data")):
+            continue
         pts = [P(px, py) for px, py in st.get("points", [])]
         if len(pts) >= 2:
             draw.line(pts, fill=st.get("color", "#ef4444"), width=max(1, round(st.get("width", 3) * S)), joint="curve")
 
     # Sticky Notes
     for s in model.sticky_notes.values():
+        if not _layer_is_visible(model, s.get("layer", "Annotations")):
+            continue
         sx, sy, sw, sh = s["x"], s["y"], s["w"], s["h"]
         p1 = P(sx - sw / 2, sy - sh / 2)
         p2 = P(sx + sw / 2, sy + sh / 2)
@@ -581,7 +755,7 @@ def export_raster(model, filepath, kind="png"):
     # Group parallel edges
     edge_pairs = {}
     for cid, c in model.conns.items():
-        if c["a"] in model.nodes and c["b"] in model.nodes:
+        if _connection_is_visible(model, c):
             pair = tuple(sorted([c["a"], c["b"]]))
             edge_pairs.setdefault(pair, []).append(cid)
 
@@ -594,7 +768,10 @@ def export_raster(model, filepath, kind="png"):
             pts = [P(px, py) for px, py in sample_curve(kind_g, raw)]
             col = cn.get("color", "#374151")
             wd = max(1, round(cn.get("width", 2) * S))
-            draw.line(pts, fill=col, width=wd, joint="curve")
+            draw_styled_line(
+                pts, col, wd,
+                cn.get("line_style", "dashed" if cn.get("dash") else "solid"),
+            )
 
             # Arrowhead at end
             if cn.get("arrow") in ("forward", "both") and len(pts) >= 2:
@@ -618,6 +795,8 @@ def export_raster(model, filepath, kind="png"):
 
     # Nodes
     for n in model.nodes.values():
+        if not _layer_is_visible(model, n.get("layer", "Data")):
+            continue
         x, y, w, h = n["x"], n["y"], n["w"], n["h"]
         hw, hh = w / 2.0, h / 2.0
         sh = n.get("shape", "rounded")
@@ -661,11 +840,34 @@ def export_raster(model, filepath, kind="png"):
         elif sh == "rectangle":
             draw.rectangle([p1, p2], **kw)
 
+        image_path = n.get("image_path")
+        if image_path and os.path.isfile(image_path):
+            with Image.open(image_path) as source:
+                source = source.convert("RGBA")
+                source.thumbnail(
+                    (max(1, round((w - 14) * S)), max(1, round((h * 0.55) * S))),
+                    Image.Resampling.LANCZOS,
+                )
+                ix, iy = P(x, y - hh * 0.18)
+                img.paste(source, (round(ix - source.width / 2), round(iy - source.height / 2)), source)
+
         txt = n.get("text", "")
         if n.get("icon"):
             txt = f"{n['icon']} {txt}"
         fs = n.get("fs", 11)
-        draw.text(P(x, y), txt, fill="#111827", font=get_font(fs), anchor="mm")
+        font = get_font(
+            fs,
+            n.get("font_family", "Helvetica"),
+            n.get("font_style", "normal"),
+        )
+        text_y = y + (hh * 0.65 if image_path and os.path.isfile(image_path) else 0)
+        draw.text(
+            P(x, text_y),
+            txt,
+            fill=n.get("text_color") or "#111827",
+            font=font,
+            anchor="mm",
+        )
 
     if kind == "pdf":
         img.save(filepath, "PDF", resolution=72 * S)
@@ -688,4 +890,3 @@ def copy_screenshot_to_clipboard(model, root):
     except Exception as e:
         print("Clipboard copy error:", e)
     return False
-

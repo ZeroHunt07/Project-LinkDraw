@@ -3,6 +3,7 @@ Comprehensive automated tests for all 70 features of LinkDraw Pro.
 """
 import os
 os.environ["LINKDRAW_TEST"] = "1"
+import math
 import tempfile
 import tkinter as tk
 import unittest
@@ -40,6 +41,21 @@ class TestLinkDrawAllFeatures(unittest.TestCase):
         # Verify high-contrast true black
         self.app.theme.set("high_contrast")
         self.assertEqual(self.app.theme_colors()["bg"], "#000000")
+
+    def test_workspace_sidebar_and_osint_shortcut(self):
+        self.assertIn(str(self.app.sidebar), self.app.workspace_panes.panes())
+        self.assertEqual(self.app.canvas.winfo_parent(), str(self.app.workspace_panes))
+        self.assertEqual(self.app.sidebar.winfo_parent(), str(self.app.workspace_panes))
+        window = self.app.open_osint_workspace()
+        self.assertEqual(window.winfo_class(), "Toplevel")
+        self.assertEqual(len(self.app.sidebar.nb.tabs()), 2)
+        self.assertIs(self.app.sidebar.osint_window, window)
+        self.app.open_osint_workspace()
+        self.assertIs(self.app.sidebar.osint_window, window)
+        self.app.toggle_sidebar()
+        self.assertNotIn(str(self.app.sidebar), self.app.workspace_panes.panes())
+        self.app.open_osint_workspace()
+        self.assertNotIn(str(self.app.sidebar), self.app.workspace_panes.panes())
 
     def test_02_03_04_05_connections_and_geometry(self):
         # 2. Curved edges, 3. Arrowheads, 4. Self-loops, 5. Bundling
@@ -152,7 +168,11 @@ class TestLinkDrawAllFeatures(unittest.TestCase):
         # 17. Inline label editing
         nid = next(iter(self.app.model.nodes))
         editor = dialogs.InlineTextEditor(self.app, nid)
+        editor.text_widget.delete("1.0", "end")
+        editor.text_widget.insert("1.0", "Renamed node")
         editor.commit()
+        self.assertEqual(self.app.model.nodes[nid]["text"], "Renamed node")
+        self.assertTrue(self.app.dirty)
 
         # 18. Edge weight editing
         cid = next(iter(self.app.model.conns))
@@ -177,6 +197,28 @@ class TestLinkDrawAllFeatures(unittest.TestCase):
         # 23. Grid
         p3 = layouts.compute_grid(self.app.model, node_ids)
         self.assertEqual(len(p3), len(node_ids))
+
+        # Additional graph views: distance shells and topology-ordered spiral
+        p_concentric = layouts.compute_concentric(self.app.model, node_ids)
+        p_spiral = layouts.compute_spiral(self.app.model, node_ids)
+        self.assertEqual(set(p_concentric), set(node_ids))
+        self.assertEqual(set(p_spiral), set(node_ids))
+        self.assertTrue(all(math.isfinite(coord) for point in p_concentric.values() for coord in point))
+        self.assertTrue(all(math.isfinite(coord) for point in p_spiral.values() for coord in point))
+        self.assertEqual(p_spiral, layouts.compute_spiral(self.app.model, node_ids))
+
+        disconnected = GraphModel()
+        disconnected_ids = [
+            disconnected.make_node(0, 0, "A"),
+            disconnected.make_node(0, 0, "B"),
+            disconnected.make_node(0, 0, "C"),
+        ]
+        disconnected.make_conn(disconnected_ids[0], disconnected_ids[1])
+        for layout in (layouts.compute_concentric, layouts.compute_spiral):
+            positions = layout(disconnected, disconnected_ids)
+            self.assertEqual(set(positions), set(disconnected_ids))
+            self.assertEqual(len(set(positions.values())), len(disconnected_ids))
+            self.assertEqual(layout(disconnected, []), {})
 
         # 24. Hierarchical (Sugiyama)
         p4 = layouts.compute_hierarchical_sugiyama(self.app.model, node_ids)

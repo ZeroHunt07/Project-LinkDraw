@@ -3,10 +3,13 @@ Dialogs, Views, Overlays, and UI panels.
 Covers features 17–20, 44–46, 51–55, 56–57, 60, 66.
 """
 import json
+import webbrowser
 import tkinter as tk
+from collections import deque
 from tkinter import ttk, simpledialog, messagebox, colorchooser
 from graph_model import SHAPES, LINE_TYPES, ARROWS, NODE_COLORS_LIGHT, LINE_COLORS_LIGHT
 import algorithms
+import formula_engine
 
 
 # ---- 17. Inline Label Editor on Canvas
@@ -28,42 +31,57 @@ class InlineTextEditor:
                                    wrap="word", width=12, height=3, bd=0, highlightthickness=0)
         self.text_widget.pack(fill="both", expand=True, padx=2, pady=2)
         self.text_widget.insert("1.0", self.node["text"])
-        self.text_widget.focus_set()
-        self.text_widget.tag_add("sel", "1.0", "end")
-
         self.win = app.canvas.create_window(sx, sy, window=self.frame, width=w, height=h)
 
         self.text_widget.bind("<Return>", self._on_return)
         self.text_widget.bind("<Shift-Return>", lambda e: None)
         self.text_widget.bind("<Escape>", self._on_cancel)
         self.text_widget.bind("<FocusOut>", self._on_focus_out)
+        self.text_widget.focus_set()
+        self.text_widget.tag_add("sel", "1.0", "end-1c")
 
     def _on_return(self, event):
         if not (event.state & 0x1):  # Plain return commits
             self.commit()
             return "break"
+        return None
 
     def _on_cancel(self, event=None):
         self.destroy()
 
     def _on_focus_out(self, event=None):
+        self.text_widget.after_idle(self._commit_if_focus_left)
+
+    def _commit_if_focus_left(self):
+        try:
+            focused = self.app.root.focus_get()
+            if focused is self.text_widget or focused is self.frame:
+                return
+        except tk.TclError:
+            pass
         self.commit()
 
     def commit(self):
+        if not hasattr(self, "text_widget") or not self.text_widget.winfo_exists():
+            return
         new_text = self.text_widget.get("1.0", "end-1c").strip()
-        if new_text and self.node_id in self.app.model.nodes:
-            self.app.model.push_undo()
-            self.app.model.nodes[self.node_id]["text"] = new_text
-            self.app.model.update_spatial_node(self.node_id)
-            if self.on_commit:
-                self.on_commit()
+        if self.node_id in self.app.model.nodes:
+            node = self.app.model.nodes[self.node_id]
+            if node.get("text", "") != new_text:
+                self.app.model.push_undo()
+                node["text"] = new_text
+                self.app.model.update_spatial_node(self.node_id)
+                self.app.model.dirty = True
+                self.app.dirty = True
+                if self.on_commit:
+                    self.on_commit()
         self.destroy()
 
     def destroy(self):
         try:
             self.app.canvas.delete(self.win)
             self.frame.destroy()
-        except Exception:
+        except tk.TclError:
             pass
         self.app.canvas.focus_set()
         self.app.redraw()
@@ -97,8 +115,14 @@ class EdgeContextMenu:
             a_menu.add_command(label=arr.title(), command=lambda a=arr: self.set_arrow(a))
         menu.add_cascade(label=f"Arrow: {cn.get('arrow', 'forward').title()}", menu=a_menu)
 
-        # Reverse direction
+        # Reverse direction / flow
         menu.add_command(label="Reverse Direction", command=self.reverse)
+        menu.add_separator()
+
+        flow_menu = tk.Menu(menu, tearoff=0)
+        for direction in ARROWS:
+            flow_menu.add_command(label=direction.title(), command=lambda d=direction: self.set_arrow(d))
+        menu.add_cascade(label="Flow Direction", menu=flow_menu)
         menu.add_separator()
 
         # Color
@@ -359,6 +383,349 @@ class AdjacencyMatrixView(tk.Toplevel):
         hsb.grid(row=1, column=0, sticky="ew")
         f.grid_rowconfigure(0, weight=1)
         f.grid_columnconfigure(0, weight=1)
+
+
+class TreeView(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Graph Tree View")
+        self.geometry("760x520")
+        self.canvas = tk.Canvas(self, bg="#f8fafc", highlightthickness=0)
+        self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=self.hsb.set, yscrollcommand=self.vsb.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vsb.grid(row=0, column=1, sticky="ns")
+        self.hsb.grid(row=1, column=0, sticky="ew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.canvas.bind("<Double-1>", self.focus_node)
+        self.populate()
+
+    def populate(self):
+        self.canvas.delete("all")
+        model = self.app.model
+        if not model.nodes:
+            self.canvas.create_text(30, 30, anchor="nw", text="No nodes to show in tree view.")
+            return
+
+        children = {nid: [] for nid in model.nodes}
+        indegree = {nid: 0 for nid in model.nodes}
+        for connection in model.conns.values():
+            a, b = connection["a"], connection["b"]
+            if a in children and b in children and a != b:
+                children[a].append(b)
+                indegree[b] += 1
+
+        roots = [nid for nid in sorted(model.nodes) if indegree[nid] == 0]
+        if not roots:
+            roots = [sorted(model.nodes)[0]]
+
+        levels = {0: roots}
+        seen = set()
+        queue = deque([(root, 0) for root in roots])
+        while queue:
+            nid, depth = queue.popleft()
+            if nid in seen:
+                continue
+            seen.add(nid)
+            for child in sorted(children[nid], key=lambda item: model.nodes[item]["text"]):
+                if child not in seen:
+                    levels.setdefault(depth + 1, []).append(child)
+                    queue.append((child, depth + 1))
+
+        x_step = 220
+        y_step = 130
+        node_w = 120
+        node_h = 52
+        width = max(800, (max(levels) + 2) * x_step)
+        height = max(360, (max(len(v) for v in levels.values()) + 2) * y_step)
+        self.canvas.configure(scrollregion=(0, 0, width, height))
+
+        for depth, node_ids in sorted(levels.items()):
+            nodes_in_level = sorted(node_ids, key=lambda item: model.nodes[item]["text"])
+            for index, nid in enumerate(nodes_in_level):
+                x = 80 + depth * x_step
+                y = 70 + index * y_step
+                node = model.nodes[nid]
+                self.canvas.create_rectangle(x, y, x + node_w, y + node_h, fill=node.get("color", "#dbeafe"), outline="#2563eb", width=2, tags=("node", str(nid)))
+                self.canvas.create_text(x + node_w / 2, y + 18, text=node.get("text", "Node"), font=("Helvetica", 10, "bold"), tags=("node", str(nid)))
+                self.canvas.create_text(x + node_w / 2, y + 36, text=f"#{nid}", font=("Helvetica", 8), fill="#334155", tags=("node", str(nid)))
+                self.canvas.tag_bind("node", "<Button-1>", lambda event, node_id=nid: self.focus_node(node_id=node_id))
+
+                for parent in children:
+                    if nid in children[parent]:
+                        parent_depth = max((d for d, ids in levels.items() if parent in ids), default=0)
+                        parent_index = levels[parent_depth].index(parent)
+                        px = 80 + parent_depth * x_step + node_w / 2
+                        py = 70 + parent_index * y_step + node_h / 2
+                        self.canvas.create_line(px, py, x + node_w / 2, y + node_h / 2, fill="#94a3b8", width=2)
+
+    def focus_node(self, _event=None, node_id=None):
+        nid = node_id if node_id is not None else self._node_from_canvas_event(_event)
+        if nid is None:
+            return
+        self.app.select(nodes={nid})
+        node = self.app.model.nodes[nid]
+        self.app.ox = self.app.canvas.winfo_width() / 2 - node["x"] * self.app.scale
+        self.app.oy = self.app.canvas.winfo_height() / 2 - node["y"] * self.app.scale
+        self.app.redraw()
+
+    def _node_from_canvas_event(self, event):
+        item = self.canvas.find_closest(event.x, event.y)
+        if not item:
+            return None
+        for candidate in self.canvas.gettags(item[0]):
+            if candidate.isdigit():
+                return int(candidate)
+        return None
+
+
+class TimelineView(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Graph Timeline")
+        self.geometry("820x480")
+        self.canvas = tk.Canvas(self, bg="#ffffff", highlightthickness=0)
+        self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=self.hsb.set, yscrollcommand=self.vsb.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vsb.grid(row=0, column=1, sticky="ns")
+        self.hsb.grid(row=1, column=0, sticky="ew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.canvas.bind("<Double-1>", self.focus_node)
+        self.populate()
+
+    def populate(self):
+        self.canvas.delete("all")
+        nodes = sorted(
+            self.app.model.nodes.items(),
+            key=lambda item: (item[1].get("created_at", "Unknown"), item[0]),
+        )
+        if not nodes:
+            self.canvas.create_text(20, 20, anchor="nw", text="No timeline entries yet.")
+            return
+
+        canvas_w = max(700, len(nodes) * 150 + 120)
+        canvas_h = 320
+        self.canvas.configure(scrollregion=(0, 0, canvas_w, canvas_h))
+        self.canvas.create_line(40, 180, canvas_w - 30, 180, fill="#94a3b8", width=2)
+
+        for index, (nid, node) in enumerate(nodes):
+            x = 80 + index * 140
+            y = 180 + ((index % 3) - 1) * 48
+            self.canvas.create_line(x, 180, x, y, fill="#cbd5e1", width=1)
+            self.canvas.create_oval(x - 18, y - 18, x + 18, y + 18, fill=node.get("color", "#93c5fd"), outline="#1d4ed8", width=2, tags=("node", str(nid)))
+            self.canvas.create_text(x, y, text=str(nid), fill="#111827", font=("Helvetica", 8, "bold"), tags=("node", str(nid)))
+            self.canvas.create_text(x, y + 30, text=node.get("text", "Node"), font=("Helvetica", 9), tags=("node", str(nid)))
+            self.canvas.create_text(x, 210, text=node.get("created_at", "Unknown")[:16], font=("Helvetica", 8), fill="#475569", tags=("node", str(nid)))
+            self.canvas.tag_bind("node", "<Button-1>", lambda event, node_id=nid: self.focus_node(node_id=node_id))
+
+        for cid, conn in self.app.model.conns.items():
+            a, b = conn["a"], conn["b"]
+            if a not in self.app.model.nodes or b not in self.app.model.nodes:
+                continue
+            a_index = next(i for i, item in enumerate(nodes) if item[0] == a)
+            b_index = next(i for i, item in enumerate(nodes) if item[0] == b)
+            x1 = 80 + a_index * 140
+            y1 = 180 + ((a_index % 3) - 1) * 48
+            x2 = 80 + b_index * 140
+            y2 = 180 + ((b_index % 3) - 1) * 48
+            self.canvas.create_line(x1, y1, x2, y2, fill="#60a5fa", width=2, dash=(6, 4))
+
+    def focus_node(self, _event=None, node_id=None):
+        nid = node_id if node_id is not None else self._node_from_canvas_event(_event)
+        if nid is None:
+            return
+        self.app.select(nodes={nid})
+        node = self.app.model.nodes[nid]
+        self.app.ox = self.app.canvas.winfo_width() / 2 - node["x"] * self.app.scale
+        self.app.oy = self.app.canvas.winfo_height() / 2 - node["y"] * self.app.scale
+        self.app.redraw()
+
+    def _node_from_canvas_event(self, event):
+        item = self.canvas.find_closest(event.x, event.y)
+        if not item:
+            return None
+        for candidate in self.canvas.gettags(item[0]):
+            if candidate.isdigit():
+                return int(candidate)
+        return None
+
+
+class FormulaSheetDialog(tk.Toplevel):
+    COLUMNS = 8
+    ROWS = 12
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Formula Sheet")
+        self.geometry("900x600")
+        self.cells = dict(app.model.settings.get("formula_cells", {}))
+        self.entries = {}
+        self.outputs = {}
+        self.active_cell = None
+        self.status = tk.StringVar(value="Enter values or formulas such as =SUM(A1:A4) or =A1*2.")
+        frame = ttk.Frame(self, padding=8)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Spreadsheet formulas: +  −  ×  ÷  ^  SUM  AVERAGE  MIN  MAX  COUNT  ABS  ROUND  SQRT").pack(anchor="w", pady=(0, 6))
+        grid = ttk.Frame(frame)
+        grid.pack(fill="both", expand=True)
+        ttk.Label(grid, text="Cell").grid(row=0, column=0, sticky="ew")
+        for col in range(self.COLUMNS):
+            letter = self._column_label(col + 1)
+            ttk.Label(grid, text=letter, anchor="center").grid(row=0, column=col + 1, sticky="ew")
+            grid.grid_columnconfigure(col + 1, weight=1)
+        for row in range(1, self.ROWS + 1):
+            ttk.Label(grid, text=str(row), anchor="center").grid(row=row, column=0, sticky="ew")
+            for col in range(1, self.COLUMNS + 1):
+                address = f"{self._column_label(col)}{row}"
+                value = tk.StringVar(value=self.cells.get(address, ""))
+                entry = ttk.Entry(grid, textvariable=value, width=10)
+                entry.grid(row=row, column=col, sticky="ew", padx=1, pady=1)
+                entry.bind("<KeyRelease>", lambda _event, cell=address, var=value: self.update_cell(cell, var.get()))
+                entry.bind("<FocusIn>", lambda _event, cell=address: self.set_active_cell(cell))
+                self.entries[address] = entry
+                entry.bind("<FocusOut>", lambda _event: self.calculate())
+        self.output_frame = ttk.Frame(frame)
+        self.output_frame.pack(fill="x", pady=(6, 2))
+        ttk.Label(frame, textvariable=self.status, wraplength=860).pack(fill="x")
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(4, 0))
+        ttk.Button(buttons, text="Apply Active Cell to Selection", command=self.apply_active_cell_to_selection).pack(side="left")
+        ttk.Button(buttons, text="Load Selected Node Values", command=self.load_selected_node_values).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Recalculate", command=self.calculate).pack(side="right")
+        self.calculate()
+        self.active_cell = self._first_nonempty_cell() or "A1"
+        self.set_active_cell(self.active_cell)
+
+    def set_active_cell(self, address):
+        self.active_cell = address.upper()
+        self.status.set(f"Active cell: {self.active_cell}. Use it to drive selected element values.")
+
+    def _first_nonempty_cell(self):
+        for row in range(1, self.ROWS + 1):
+            for col in range(1, self.COLUMNS + 1):
+                address = f"{self._column_label(col)}{row}"
+                if address in self.cells and str(self.cells[address]).strip():
+                    return address
+        return None
+
+    def _formula_context(self):
+        cells = dict(self.cells)
+        for nid, node in self.app.model.nodes.items():
+            numeric = node.get("value")
+            if isinstance(numeric, (int, float)):
+                cells[f"N{nid}"] = str(numeric)
+                cells[f"NODE{nid}"] = str(numeric)
+        return cells
+
+    def _pretty_result(self, result):
+        if isinstance(result, float):
+            if result.is_integer():
+                return str(int(result))
+            return f"{result:g}"
+        return str(result)
+
+    def apply_active_cell_to_selection(self):
+        if not self.app.sel_nodes:
+            self.status.set("Select one or more nodes before applying a formula result.")
+            return
+        if not self.active_cell or self.active_cell not in self.cells:
+            self.status.set("Pick an active cell with a numeric value or formula first.")
+            return
+        try:
+            result = formula_engine.evaluate_cell(self.active_cell, self._formula_context(), {})
+        except (TypeError, ValueError) as exc:
+            self.status.set(f"Could not apply formula: {exc}")
+            return
+        for nid in sorted(self.app.sel_nodes):
+            if nid not in self.app.model.nodes:
+                continue
+            node = self.app.model.nodes[nid]
+            node["value"] = float(result)
+            node["metadata"]["value"] = float(result)
+            if str(node.get("text", "")).strip() and str(node.get("text", "")).replace(".", "", 1).replace("-", "", 1).isdigit():
+                node["text"] = self._pretty_result(result)
+        self.app.model.dirty = True
+        self.app.dirty = True
+        self.app.redraw()
+        self.status.set(f"Applied {self.active_cell} = {self._pretty_result(result)} to selected nodes.")
+
+    def load_selected_node_values(self):
+        selected = sorted(self.app.sel_nodes)
+        if not selected:
+            self.status.set("Select one or more nodes to load their values into the sheet.")
+            return
+        for nid in selected:
+            node = self.app.model.nodes.get(nid)
+            if node is None:
+                continue
+            alias = f"N{nid}"
+            self.cells[alias] = self._pretty_result(float(node.get("value", 0.0)))
+            self.app.model.settings["formula_cells"] = dict(self.cells)
+        self.status.set(f"Loaded {len(selected)} node values into the formula sheet.")
+        self.calculate()
+
+    def update_cell(self, address, value):
+        if value.strip():
+            self.cells[address] = value.strip()
+        else:
+            self.cells.pop(address, None)
+        self.app.model.settings["formula_cells"] = dict(self.cells)
+        self.app.model.dirty = True
+        self.app.dirty = True
+        self.set_active_cell(address)
+
+    @staticmethod
+    def _column_label(number):
+        chars = []
+        while number:
+            number, remainder = divmod(number - 1, 26)
+            chars.append(chr(ord("A") + remainder))
+        return "".join(reversed(chars))
+
+    def calculate(self):
+        for widget in self.output_frame.winfo_children():
+            widget.destroy()
+        errors = []
+        cache = {}
+        context = self._formula_context()
+        for row in range(1, self.ROWS + 1):
+            values = []
+            for col in range(1, self.COLUMNS + 1):
+                address = f"{self._column_label(col)}{row}"
+                raw = self.cells.get(address, "")
+                try:
+                    result = formula_engine.evaluate_cell(address, context, cache)
+                    if isinstance(result, float):
+                        display = f"{result:g}" if result.is_integer() else str(result)
+                    else:
+                        display = str(result)
+                except (ValueError, TypeError) as exc:
+                    display = "#ERR"
+                    errors.append(f"{address}: {exc}")
+                values.append(f"{address}={display}" if raw else "")
+            text = "   ".join(value for value in values if value)
+            if text:
+                ttk.Label(self.output_frame, text=text, anchor="w").pack(fill="x")
+        self.status.set(errors[0] if errors else "Calculated. Formulas and values are saved with this document.")
+
+
+def open_privacy_safe_breach_resources(parent):
+    answer = messagebox.askyesno(
+        "External breach-checking resources",
+        "LinkDraw will open a public breach-checking service homepage only. "
+        "It will not send node values, email addresses, or passwords. Continue?",
+        parent=parent,
+    )
+    if answer:
+        webbrowser.open("https://haveibeenpwned.com/")
 
 
 # ---- 51–55. Graph Properties Panel with Degree Histogram Mini-Chart
@@ -622,4 +989,3 @@ class PreferencesDialog(tk.Toplevel):
         self.app.snap_var.set(s["snap"])
         self.app.redraw()
         self.destroy()
-

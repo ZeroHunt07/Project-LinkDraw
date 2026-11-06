@@ -52,6 +52,115 @@ def compute_grid(model, node_ids, cell_w=180.0, cell_h=120.0):
     return pos
 
 
+def compute_concentric(model, node_ids, ring_spacing=170.0):
+    """Arrange nodes on rings according to distance from component centers."""
+    if not node_ids:
+        return {}
+    idset = set(node_ids)
+    order = {nid: index for index, nid in enumerate(node_ids)}
+    adj = {nid: set() for nid in node_ids}
+    for conn in model.conns.values():
+        a, b = conn["a"], conn["b"]
+        if a in idset and b in idset and a != b:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    distances = {}
+    unseen = set(node_ids)
+    while unseen:
+        component_seed = min(unseen, key=order.get)
+        component = []
+        queue = deque([component_seed])
+        unseen.remove(component_seed)
+        while queue:
+            nid = queue.popleft()
+            component.append(nid)
+            for neighbor in sorted(adj[nid], key=order.get):
+                if neighbor in unseen:
+                    unseen.remove(neighbor)
+                    queue.append(neighbor)
+
+        root = max(component, key=lambda nid: (len(adj[nid]), -order[nid]))
+        queue = deque([(root, 0)])
+        distances[root] = 0
+        while queue:
+            nid, depth = queue.popleft()
+            for neighbor in adj[nid]:
+                if neighbor not in distances:
+                    distances[neighbor] = depth + 1
+                    queue.append((neighbor, depth + 1))
+
+    shells = {}
+    for nid in node_ids:
+        shells.setdefault(distances[nid], []).append(nid)
+
+    positions = {}
+    multiple_centers = len(shells.get(0, [])) > 1
+    previous_radius = 0.0
+    for depth in sorted(shells):
+        shell = shells[depth]
+        if depth == 0 and len(shell) == 1:
+            positions[shell[0]] = (0.0, 0.0)
+            continue
+        node_span = max(
+            max(model.nodes[nid].get("w", 130), model.nodes[nid].get("h", 60))
+            for nid in shell
+        )
+        base_radius = ring_spacing * (depth + 1 if multiple_centers else depth)
+        circumference_radius = node_span * len(shell) * 1.25 / (2.0 * math.pi)
+        radius = max(base_radius, circumference_radius, previous_radius + node_span * 1.5)
+        previous_radius = radius
+        for index, nid in enumerate(shell):
+            angle = -math.pi / 2 + 2.0 * math.pi * index / len(shell)
+            positions[nid] = (radius * math.cos(angle), radius * math.sin(angle))
+    return positions
+
+
+def compute_spiral(model, node_ids, spacing=None):
+    """Place breadth-first graph order along an expanding spiral."""
+    if not node_ids:
+        return {}
+    idset = set(node_ids)
+    order = {nid: index for index, nid in enumerate(node_ids)}
+    adj = {nid: set() for nid in node_ids}
+    for conn in model.conns.values():
+        a, b = conn["a"], conn["b"]
+        if a in idset and b in idset and a != b:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    traversal = []
+    unseen = set(node_ids)
+    roots = sorted(node_ids, key=lambda nid: (-len(adj[nid]), order[nid]))
+    for root in roots:
+        if root not in unseen:
+            continue
+        unseen.remove(root)
+        queue = deque([root])
+        while queue:
+            nid = queue.popleft()
+            traversal.append(nid)
+            for neighbor in sorted(adj[nid], key=lambda item: (-len(adj[item]), order[item])):
+                if neighbor in unseen:
+                    unseen.remove(neighbor)
+                    queue.append(neighbor)
+
+    if spacing is None:
+        largest_node = max(
+            max(model.nodes[nid].get("w", 130), model.nodes[nid].get("h", 60))
+            for nid in node_ids
+        )
+        spacing = max(110.0, largest_node * 1.15)
+    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+    return {
+        nid: (
+            spacing * math.sqrt(index) * math.cos(index * golden_angle),
+            spacing * math.sqrt(index) * math.sin(index * golden_angle),
+        )
+        for index, nid in enumerate(traversal)
+    }
+
+
 def compute_hierarchical_sugiyama(model, node_ids, layer_dist=140.0, node_dist=180.0):
     """24. Hierarchical / Layered layout — Sugiyama-style DAG rendering."""
     if not node_ids:
@@ -385,4 +494,3 @@ class LayoutAnimator:
             self.timer_id = None
             self.app.model.mark_dirty if hasattr(self.app.model, "mark_dirty") else None
             self.app.fit()
-

@@ -10,7 +10,10 @@ import io
 import json
 import math
 import os
+import queue
 import sys
+import time
+import uuid
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
@@ -29,6 +32,7 @@ import dialogs
 import panels
 import drawing_tools
 import linkdraw_investigation
+from collaboration_client import CollaborationClient, canonical_state
 
 MOD = "Command" if sys.platform == "darwin" else "Control"
 MM_W, MM_H = 190, 130
@@ -48,6 +52,16 @@ class LinkDrawApp:
         self.clip = None
         self.paste_offset = 0
         self.style_clipboard = None
+        self.collaboration_client = None
+        self.collaboration_project_id = None
+        self.collaboration_base_state = None
+        self.collaboration_base_fingerprint = None
+        self.collaboration_revision = None
+        self.collaboration_pending = False
+        self.collaboration_last_submitted = None
+        self.collaboration_retry_after = 0.0
+        self.collaboration_next_snapshot_check = 0.0
+        self.collaboration_tick_id = None
 
         # ---- View & Coordinates
         self.scale = 1.0
@@ -216,6 +230,14 @@ class LinkDrawApp:
         f.add_separator()
         f.add_command(label="Quit", command=self.on_close)
         m.add_cascade(label="File", menu=f)
+
+        collaboration = tk.Menu(m, tearoff=0)
+        collaboration.add_command(
+            label="Connect / Create Shared Investigation…",
+            command=self.connect_shared_investigation,
+        )
+        collaboration.add_command(label="Disconnect", command=self.disconnect_shared_investigation)
+        m.add_cascade(label="Collaboration", menu=collaboration)
 
         # ---- Edit
         e = tk.Menu(m, tearoff=0)
@@ -3021,6 +3043,12 @@ class LinkDrawApp:
     # File Operations, Import / Export (10, 41–43, 47–50)
     # =========================================================================
     def new_doc(self):
+        if self.collaboration_client and not messagebox.askyesno(
+            "Replace Shared Investigation",
+            "Creating a new diagram will replace the shared investigation for everyone. Continue?",
+            parent=self.root,
+        ):
+            return
         if self.dirty and not messagebox.askyesno("Unsaved Changes", "Discard unsaved changes?"):
             return
         self.model = GraphModel()
@@ -3037,6 +3065,12 @@ class LinkDrawApp:
             self.open_file_path(p)
 
     def open_file_path(self, path):
+        if self.collaboration_client and not messagebox.askyesno(
+            "Replace Shared Investigation",
+            "Opening this file will replace the shared investigation for everyone. Continue?",
+            parent=self.root,
+        ):
+            return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -3050,6 +3084,231 @@ class LinkDrawApp:
             self.fit()
         except Exception as e:
             messagebox.showerror("Open Error", str(e))
+
+    def connect_shared_investigation(self):
+        if self.collaboration_client:
+            messagebox.showinfo(
+                "Collaboration",
+                "Disconnect from the current shared investigation before connecting to another.",
+                parent=self.root,
+            )
+            return
+        mongo_uri = simpledialog.askstring(
+            "MongoDB Connection",
+            "MongoDB connection URI (mongodb+srv://…):",
+            show="*",
+            parent=self.root,
+        )
+        if mongo_uri is None:
+            return
+        database_name = simpledialog.askstring(
+            "MongoDB Database",
+            "Database name:",
+            initialvalue="linkdraw",
+            parent=self.root,
+        )
+        if database_name is None:
+            return
+        project_id = simpledialog.askstring(
+            "Shared Investigation",
+            "Enter an existing investigation ID to join, or leave blank to create one:",
+            parent=self.root,
+        )
+        if project_id is None:
+            return
+        create_new = not project_id.strip()
+        project_id = uuid.uuid4().hex if create_new else project_id.strip()
+        try:
+            client = CollaborationClient(
+                mongo_uri.strip(),
+                database_name.strip(),
+                project_id,
+                create_new,
+                copy.deepcopy(self.model.to_dict()),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Collaboration", str(exc), parent=self.root)
+            return
+        self.collaboration_client = client
+        self.collaboration_project_id = project_id
+        self.collaboration_base_state = None
+        self.collaboration_base_fingerprint = None
+        self.collaboration_revision = None
+        self.collaboration_pending = False
+        self.collaboration_last_submitted = None
+        self.collaboration_retry_after = 0.0
+        self.collaboration_next_snapshot_check = 0.0
+        client.start()
+        self.status.set("Connecting to shared investigation…")
+        self._schedule_collaboration_tick()
+
+    def disconnect_shared_investigation(self, preserve_local=True):
+        client = self.collaboration_client
+        if client is None:
+            self.status.set("Not connected to a shared investigation.")
+            return
+        unsynced = self.collaboration_pending
+        if self.collaboration_base_fingerprint is not None:
+            unsynced = unsynced or (
+                canonical_state(self.model.to_dict())
+                != self.collaboration_base_fingerprint
+            )
+        if preserve_local and unsynced and not messagebox.askyesno(
+            "Disconnect Collaboration",
+            "Local changes may not have reached the server yet. Disconnect and keep this diagram locally?",
+            parent=self.root,
+        ):
+            return
+        client.stop()
+        self.collaboration_client = None
+        self.collaboration_project_id = None
+        self.collaboration_base_state = None
+        self.collaboration_base_fingerprint = None
+        self.collaboration_revision = None
+        self.collaboration_pending = False
+        self.collaboration_last_submitted = None
+        self.root.title("LinkDraw Pro")
+        self.status.set("Disconnected. Local diagram remains open.")
+
+    def _schedule_collaboration_tick(self):
+        if self.collaboration_tick_id is None:
+            self.collaboration_tick_id = self.root.after(250, self._collaboration_tick)
+
+    def _collaboration_tick(self):
+        self.collaboration_tick_id = None
+        client = self.collaboration_client
+        if client is None:
+            return
+        while True:
+            try:
+                event = client.events.get_nowait()
+            except queue.Empty:
+                break
+            event_type = event["type"]
+            if event_type == "error":
+                if event.get("initial"):
+                    messagebox.showerror("Collaboration", event["message"], parent=self.root)
+                    self.disconnect_shared_investigation(preserve_local=False)
+                    return
+                self.collaboration_pending = False
+                self.collaboration_last_submitted = None
+                self.collaboration_retry_after = time.monotonic() + 2.0
+                self.status.set(f"Collaboration waiting: {event['message']}")
+                continue
+            if event_type == "created":
+                self.collaboration_base_state = copy.deepcopy(event["state"])
+                self.collaboration_base_fingerprint = canonical_state(event["state"])
+                self.collaboration_revision = event["revision"]
+                self.root.title(f"LinkDraw Pro - Shared {self.collaboration_project_id}")
+                self.status.set(
+                    f"Shared investigation created: {self.collaboration_project_id}"
+                )
+                messagebox.showinfo(
+                    "Shared Investigation Created",
+                    f"Investigation ID:\n{self.collaboration_project_id}\n\n"
+                    "Share this ID and MongoDB connection details with trusted collaborators.",
+                    parent=self.root,
+                )
+                continue
+            if event_type == "joined":
+                if not messagebox.askyesno(
+                    "Join Shared Investigation",
+                    "Load the shared diagram? This replaces the diagram currently open in this window.",
+                    parent=self.root,
+                ):
+                    self.disconnect_shared_investigation(preserve_local=False)
+                    return
+                self._apply_collaboration_state(event["state"])
+                self.collaboration_base_state = copy.deepcopy(event["state"])
+                self.collaboration_base_fingerprint = canonical_state(event["state"])
+                self.collaboration_revision = event["revision"]
+                self.root.title(f"LinkDraw Pro - Shared {self.collaboration_project_id}")
+                self.status.set(f"Joined shared investigation {self.collaboration_project_id}.")
+                continue
+            if event_type == "saved":
+                self.collaboration_base_state = copy.deepcopy(event["state"])
+                self.collaboration_base_fingerprint = canonical_state(event["state"])
+                self.collaboration_revision = event["revision"]
+                self.collaboration_pending = False
+                self.collaboration_last_submitted = None
+                self.status.set("Shared changes saved.")
+                continue
+            if event_type in {"remote", "conflict"}:
+                self._handle_collaboration_update(event["state"], event["revision"])
+
+        if self.collaboration_client is not None:
+            if (
+                self.collaboration_base_state is not None
+                and not self.collaboration_pending
+                and time.monotonic() >= self.collaboration_retry_after
+                and time.monotonic() >= self.collaboration_next_snapshot_check
+                and not client.is_paused
+            ):
+                self.collaboration_next_snapshot_check = time.monotonic() + 0.5
+                state = self.model.to_dict()
+                fingerprint = canonical_state(state)
+                if (
+                    fingerprint != self.collaboration_base_fingerprint
+                    and fingerprint != self.collaboration_last_submitted
+                ):
+                    self.collaboration_pending = True
+                    self.collaboration_last_submitted = fingerprint
+                    client.submit(copy.deepcopy(state), self.collaboration_revision)
+            self._schedule_collaboration_tick()
+
+    def _apply_collaboration_state(self, state):
+        self.model.load_dict(copy.deepcopy(state))
+        self.sync_document_settings()
+        self.sel_nodes.clear()
+        self.sel_conn = None
+        self.sel_sticky = None
+        self.dirty = True
+        self.redraw()
+
+    def _handle_collaboration_update(self, state, revision):
+        client = self.collaboration_client
+        if client is None:
+            return
+        local_fingerprint = canonical_state(self.model.to_dict())
+        if (
+            not self.collaboration_pending
+            and local_fingerprint == self.collaboration_base_fingerprint
+        ):
+            self._apply_collaboration_state(state)
+            self.collaboration_base_state = copy.deepcopy(state)
+            self.collaboration_base_fingerprint = canonical_state(state)
+            self.collaboration_revision = revision
+            self.collaboration_last_submitted = None
+            self.status.set("Received shared changes.")
+            return
+
+        client.pause()
+        self.collaboration_pending = False
+        choice = messagebox.askyesnocancel(
+            "Collaboration Conflict",
+            "The shared investigation changed while you also had local edits.\n\n"
+            "Yes: load the latest shared diagram and discard your local edits.\n"
+            "No: overwrite the shared diagram with your local version.\n"
+            "Cancel: disconnect and keep your local diagram.",
+            parent=self.root,
+        )
+        if choice is True:
+            self._apply_collaboration_state(state)
+            self.collaboration_base_state = copy.deepcopy(state)
+            self.collaboration_base_fingerprint = canonical_state(state)
+            self.collaboration_revision = revision
+            self.collaboration_last_submitted = None
+            client.resume(revision)
+            self.status.set("Loaded the latest shared diagram.")
+        elif choice is False:
+            self.collaboration_base_state = copy.deepcopy(state)
+            self.collaboration_base_fingerprint = canonical_state(state)
+            self.collaboration_revision = revision
+            self.collaboration_last_submitted = None
+            client.resume(revision)
+            self.status.set("Your local diagram will replace the shared version.")
+        else:
+            self.disconnect_shared_investigation(preserve_local=False)
 
     def save_doc(self):
         if not self.path:
@@ -3270,6 +3529,22 @@ class LinkDrawApp:
         if not self.sidebar.flush_pending_notes():
             return
         self.sidebar.page_manager.persist()
+
+        collaboration_unsynced = self.collaboration_pending
+        if self.collaboration_client and self.collaboration_base_state is not None:
+            collaboration_unsynced = collaboration_unsynced or (
+                canonical_state(self.model.to_dict())
+                != self.collaboration_base_fingerprint
+            )
+        if collaboration_unsynced and not messagebox.askyesno(
+            "Collaboration Sync",
+            "This diagram has shared changes that may not have reached the server. "
+            "Close anyway? Your local autosave will be kept.",
+            parent=self.root,
+        ):
+            return
+        if self.collaboration_client:
+            self.collaboration_client.stop()
         io_manager.save_autosave(self.model)
         self.root.destroy()
 
